@@ -339,6 +339,12 @@ func (suite *KubeTestSuite) GetFunctionPods(functionName string) []v1.Pod {
 	return pods.Items
 }
 
+func (suite *KubeTestSuite) GetNodes() []v1.Node {
+	nodesList, err := suite.KubeClientSet.CoreV1().Nodes().List(metav1.ListOptions{})
+	suite.Require().NoError(err)
+	return nodesList.Items
+}
+
 func (suite *KubeTestSuite) DeleteFunctionPods(functionName string) {
 	errGroup, _ := errgroup.WithContext(context.TODO())
 	for _, pod := range suite.GetFunctionPods(functionName) {
@@ -413,6 +419,40 @@ func (suite *KubeTestSuite) WaitForAPIGatewayState(getAPIGatewayOptions *platfor
 			return apiGateway.GetConfig().Status.State == desiredAPIGatewayState
 		})
 	suite.Require().NoError(err, "Api gateway did not reach its desired state")
+}
+
+func (suite *KubeTestSuite) KubectlInvokeFunctionViaCurl(functionName string, curlCommand string) string {
+	curlPodName := fmt.Sprintf("curl-%s", functionName)
+
+	// start curl pod, let it sleep
+	runCurlPodCommand := fmt.Sprintf(""+
+		"kubectl "+
+		"run "+
+		"%s "+
+		"--image=curlimages/curl:7.77.0 "+
+		"--restart=Never "+
+		"--command -- "+
+		"sleep 600",
+		curlPodName)
+	_, err := suite.CmdRunner.Run(nil, runCurlPodCommand)
+	suite.Require().NoError(err)
+
+	waitForCurlPodReadyCommand := fmt.Sprintf("kubectl wait --for=condition=ready pod/%s", curlPodName)
+	_, err = suite.CmdRunner.Run(nil, waitForCurlPodReadyCommand)
+	suite.Require().NoError(err)
+
+	execCurlCommand := fmt.Sprintf(
+		"kubectl "+
+			"exec "+
+			"%s -- "+
+			"curl %s",
+		curlPodName,
+		curlCommand)
+
+	curlResults, err := suite.CmdRunner.Run(nil, execCurlCommand)
+	suite.Require().NoError(err)
+
+	return curlResults.Output
 }
 
 func (suite *KubeTestSuite) deployAPIGateway(createAPIGatewayOptions *platform.CreateAPIGatewayOptions,
@@ -602,7 +642,7 @@ func (suite *KubeTestSuite) compileCreateAPIGatewayOptions(apiGatewayName string
 				Upstreams: []platform.APIGatewayUpstreamSpec{
 					{
 						Kind: platform.APIGatewayUpstreamKindNuclioFunction,
-						Nucliofunction: &platform.NuclioFunctionAPIGatewaySpec{
+						NuclioFunction: &platform.NuclioFunctionAPIGatewaySpec{
 							Name: functionName,
 						},
 					},

@@ -18,9 +18,11 @@ package local
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -32,12 +34,13 @@ import (
 	"github.com/nuclio/nuclio/pkg/containerimagebuilderpusher"
 	"github.com/nuclio/nuclio/pkg/dockerclient"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/platform"
 	"github.com/nuclio/nuclio/pkg/platform/abstract"
 	"github.com/nuclio/nuclio/pkg/platform/abstract/project"
 	externalproject "github.com/nuclio/nuclio/pkg/platform/abstract/project/external"
+	"github.com/nuclio/nuclio/pkg/platform/abstract/project/internalc/local"
 	"github.com/nuclio/nuclio/pkg/platform/local/client"
-	internalproject "github.com/nuclio/nuclio/pkg/platform/local/project"
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/processor"
 	"github.com/nuclio/nuclio/pkg/processor/config"
@@ -64,7 +67,7 @@ const FunctionProcessorContainerDirPath = "/etc/nuclio/config/processor"
 func NewProjectsClient(platform *Platform, platformConfiguration *platformconfig.Config) (project.Client, error) {
 
 	// create local projects client
-	localProjectsClient, err := internalproject.NewClient(platform.Logger, platform, platform.localStore)
+	localProjectsClient, err := local.NewClient(platform.Logger, platform, platform.localStore)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to create internal projects client (local)")
 	}
@@ -141,7 +144,18 @@ func NewPlatform(parentLogger logger.Logger,
 }
 
 func (p *Platform) Initialize() error {
-	return p.projectsClient.Initialize()
+	if err := p.projectsClient.Initialize(); err != nil {
+		return errors.Wrap(err, "Failed to initialize projects client")
+	}
+
+	// ensure default project existence only when projects aren't managed by external leader
+	if p.Config.ProjectsLeader == nil {
+		if err := p.EnsureDefaultProjectExistence(); err != nil {
+			return errors.Wrap(err, "Failed to ensure default project existence")
+		}
+	}
+
+	return nil
 }
 
 // CreateFunction will simply run a docker image
@@ -164,6 +178,16 @@ func (p *Platform) CreateFunction(createFunctionOptions *platform.CreateFunction
 
 	if err := p.enrichAndValidateFunctionConfig(&createFunctionOptions.FunctionConfig); err != nil {
 		return nil, errors.Wrap(err, "Failed to enrich and validate a function configuration")
+	}
+
+	// Check OPA permissions
+	permissionOptions := createFunctionOptions.PermissionOptions
+	permissionOptions.RaiseForbidden = true
+	if _, err := p.QueryOPAFunctionPermissions(createFunctionOptions.FunctionConfig.Meta.Labels["nuclio.io/project-name"],
+		createFunctionOptions.FunctionConfig.Meta.Name,
+		opa.ActionCreate,
+		&permissionOptions); err != nil {
+		return nil, errors.Wrap(err, "Failed authorizing OPA permissions for resource")
 	}
 
 	// local currently doesn't support registries of any kind. remove push / run registry
@@ -230,7 +254,7 @@ func (p *Platform) CreateFunction(createFunctionOptions *platform.CreateFunction
 		}
 
 		// create the function in the store
-		if err = p.localStore.CreateOrUpdateFunction(&functionconfig.ConfigWithStatus{
+		if err := p.localStore.CreateOrUpdateFunction(&functionconfig.ConfigWithStatus{
 			Config: createFunctionOptions.FunctionConfig,
 			Status: functionconfig.Status{
 				State: functionconfig.FunctionStateBuilding,
@@ -267,9 +291,7 @@ func (p *Platform) CreateFunction(createFunctionOptions *platform.CreateFunction
 
 		var createFunctionResult *platform.CreateFunctionResult
 		var deployErr error
-		functionStatus := functionconfig.Status{
-			State: functionconfig.FunctionStateImported,
-		}
+		var functionStatus functionconfig.Status
 
 		if !skipFunctionDeploy {
 			createFunctionResult, deployErr = p.deployFunction(createFunctionOptions, previousHTTPPort)
@@ -278,12 +300,16 @@ func (p *Platform) CreateFunction(createFunctionOptions *platform.CreateFunction
 				return nil, deployErr
 			}
 
-			functionStatus = functionconfig.Status{
-				HTTPPort: createFunctionResult.Port,
-				State:    functionconfig.FunctionStateReady,
+			functionStatus.HTTPPort = createFunctionResult.Port
+			functionStatus.State = functionconfig.FunctionStateReady
+
+			if err := p.populateFunctionInvocationStatus(&functionStatus,
+				createFunctionResult); err != nil {
+				return nil, errors.Wrap(err, "Failed to populate function invocation status")
 			}
 		} else {
 			p.Logger.Info("Skipping function deployment")
+			functionStatus.State = functionconfig.FunctionStateImported
 			createFunctionResult = &platform.CreateFunctionResult{
 				CreateFunctionBuildResult: platform.CreateFunctionBuildResult{
 					Image:                 createFunctionOptions.FunctionConfig.Spec.Image,
@@ -293,21 +319,22 @@ func (p *Platform) CreateFunction(createFunctionOptions *platform.CreateFunction
 		}
 
 		// update the function
-		if err = p.localStore.CreateOrUpdateFunction(&functionconfig.ConfigWithStatus{
+		if err := p.localStore.CreateOrUpdateFunction(&functionconfig.ConfigWithStatus{
 			Config: createFunctionOptions.FunctionConfig,
 			Status: functionStatus,
 		}); err != nil {
 			return nil, errors.Wrap(err, "Failed to update a function with state")
 		}
 
+		createFunctionResult.FunctionStatus = functionStatus
 		return createFunctionResult, nil
 	}
 
 	// If needed, load any docker image from archive into docker
 	if createFunctionOptions.InputImageFile != "" {
-		p.Logger.InfoWith("Loading docker image from archive", "input", createFunctionOptions.InputImageFile)
-		err := p.dockerClient.Load(createFunctionOptions.InputImageFile)
-		if err != nil {
+		p.Logger.InfoWith("Loading docker image from archive",
+			"input", createFunctionOptions.InputImageFile)
+		if err := p.dockerClient.Load(createFunctionOptions.InputImageFile); err != nil {
 			return nil, errors.Wrap(err, "Failed to load a Docker image from an archive")
 		}
 	}
@@ -322,6 +349,11 @@ func (p *Platform) GetFunctions(getFunctionsOptions *platform.GetFunctionsOption
 	functions, err := p.localStore.GetProjectFunctions(getFunctionsOptions)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to read functions from a local store")
+	}
+
+	functions, err = p.Platform.FilterFunctionsByPermissions(&getFunctionsOptions.PermissionOptions, functions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to filter functions by permissions")
 	}
 
 	// enrich with build logs
@@ -345,6 +377,35 @@ func (p *Platform) DeleteFunction(deleteFunctionOptions *platform.DeleteFunction
 
 	// actual function and its resources deletion
 	return p.delete(deleteFunctionOptions)
+}
+
+func (p *Platform) GetFunctionReplicaLogsStream(ctx context.Context,
+	options *platform.GetFunctionReplicaLogsStreamOptions) (io.ReadCloser, error) {
+
+	sinceDuration := ""
+	if options.SinceSeconds != nil {
+		sinceDuration = (time.Second * time.Duration(*options.SinceSeconds)).String()
+	}
+
+	tail := ""
+	if options.TailLines != nil {
+		tail = strconv.FormatInt(*options.TailLines, 10)
+	}
+
+	return p.dockerClient.GetContainerLogStream(ctx,
+		options.Name,
+		&dockerclient.ContainerLogsOptions{
+			Follow: options.Follow,
+			Since:  sinceDuration,
+			Tail:   tail,
+		})
+}
+
+func (p *Platform) GetFunctionReplicaNames(ctx context.Context,
+	functionConfig *functionconfig.Config) ([]string, error) {
+	return []string{
+		p.GetFunctionContainerName(functionConfig),
+	}, nil
 }
 
 // GetHealthCheckMode returns the healthcheck mode the platform requires
@@ -414,28 +475,106 @@ func (p *Platform) DeleteProject(deleteProjectOptions *platform.DeleteProjectOpt
 
 // GetProjects will list existing projects
 func (p *Platform) GetProjects(getProjectsOptions *platform.GetProjectsOptions) ([]platform.Project, error) {
-	return p.projectsClient.Get(getProjectsOptions)
+	projects, err := p.projectsClient.Get(getProjectsOptions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed getting projects")
+	}
+
+	return projects, nil
 }
 
 // CreateFunctionEvent will create a new function event that can later be used as a template from
 // which to invoke functions
 func (p *Platform) CreateFunctionEvent(createFunctionEventOptions *platform.CreateFunctionEventOptions) error {
+	if err := p.Platform.EnrichFunctionEvent(&createFunctionEventOptions.FunctionEventConfig); err != nil {
+		return errors.Wrap(err, "Failed to enrich function event")
+	}
+
+	functionName := createFunctionEventOptions.FunctionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyFunctionName]
+	projectName := createFunctionEventOptions.FunctionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyProjectName]
+
+	// Check OPA permissions
+	permissionOptions := createFunctionEventOptions.PermissionOptions
+	permissionOptions.RaiseForbidden = true
+	if _, err := p.QueryOPAFunctionEventPermissions(projectName,
+		functionName,
+		createFunctionEventOptions.FunctionEventConfig.Meta.Name,
+		opa.ActionCreate,
+		&permissionOptions); err != nil {
+		return errors.Wrap(err, "Failed authorizing OPA permissions for resource")
+	}
+
 	return p.localStore.CreateOrUpdateFunctionEvent(&createFunctionEventOptions.FunctionEventConfig)
 }
 
 // UpdateFunctionEvent will update a previously existing function event
 func (p *Platform) UpdateFunctionEvent(updateFunctionEventOptions *platform.UpdateFunctionEventOptions) error {
+	if err := p.Platform.EnrichFunctionEvent(&updateFunctionEventOptions.FunctionEventConfig); err != nil {
+		return errors.Wrap(err, "Failed to enrich function event")
+	}
+
+	functionEvents, err := p.localStore.GetFunctionEvents(&platform.GetFunctionEventsOptions{
+		Meta: updateFunctionEventOptions.FunctionEventConfig.Meta,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Failed to read function events from a local store")
+	}
+	functionEventToUpdate := functionEvents[0]
+
+	functionName := updateFunctionEventOptions.FunctionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyFunctionName]
+	projectName := updateFunctionEventOptions.FunctionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyProjectName]
+
+	// Check OPA permissions
+	permissionOptions := updateFunctionEventOptions.PermissionOptions
+	permissionOptions.RaiseForbidden = true
+	if _, err := p.QueryOPAFunctionEventPermissions(projectName,
+		functionName,
+		functionEventToUpdate.GetConfig().Meta.Name,
+		opa.ActionUpdate,
+		&permissionOptions); err != nil {
+		return errors.Wrap(err, "Failed authorizing OPA permissions for resource")
+	}
+
 	return p.localStore.CreateOrUpdateFunctionEvent(&updateFunctionEventOptions.FunctionEventConfig)
 }
 
 // DeleteFunctionEvent will delete a previously existing function event
 func (p *Platform) DeleteFunctionEvent(deleteFunctionEventOptions *platform.DeleteFunctionEventOptions) error {
+	functionEvents, err := p.localStore.GetFunctionEvents(&platform.GetFunctionEventsOptions{
+		Meta: deleteFunctionEventOptions.Meta,
+	})
+	if err != nil {
+		return errors.Wrap(err, "Failed to read function events from a local store")
+	}
+
+	if len(functionEvents) > 0 {
+		functionEventToDelete := functionEvents[0]
+		functionName := functionEventToDelete.GetConfig().Meta.Labels[common.NuclioResourceLabelKeyFunctionName]
+		projectName := functionEventToDelete.GetConfig().Meta.Labels[common.NuclioResourceLabelKeyProjectName]
+
+		// Check OPA permissions
+		permissionOptions := deleteFunctionEventOptions.PermissionOptions
+		permissionOptions.RaiseForbidden = true
+		if _, err := p.QueryOPAFunctionEventPermissions(projectName,
+			functionName,
+			functionEventToDelete.GetConfig().Meta.Name,
+			opa.ActionDelete,
+			&permissionOptions); err != nil {
+			return errors.Wrap(err, "Failed authorizing OPA permissions for resource")
+		}
+	}
+
 	return p.localStore.DeleteFunctionEvent(&deleteFunctionEventOptions.Meta)
 }
 
 // GetFunctionEvents will list existing function events
 func (p *Platform) GetFunctionEvents(getFunctionEventsOptions *platform.GetFunctionEventsOptions) ([]platform.FunctionEvent, error) {
-	return p.localStore.GetFunctionEvents(getFunctionEventsOptions)
+	functionEvents, err := p.localStore.GetFunctionEvents(getFunctionEventsOptions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to read function events from a local store")
+	}
+
+	return p.Platform.FilterFunctionEventsByPermissions(&getFunctionEventsOptions.PermissionOptions, functionEvents)
 }
 
 // GetAPIGateways not supported on this platform
@@ -551,12 +690,10 @@ func (p *Platform) ValidateFunctionContainersHealthiness() {
 			}
 
 			// get function container name
-			containerName := p.GetContainerNameByCreateFunctionOptions(&platform.CreateFunctionOptions{
-				FunctionConfig: functionconfig.Config{
-					Meta: functionconfig.Meta{
-						Name:      functionName,
-						Namespace: namespace,
-					},
+			containerName := p.GetFunctionContainerName(&functionconfig.Config{
+				Meta: functionconfig.Meta{
+					Name:      functionName,
+					Namespace: namespace,
 				},
 			})
 
@@ -610,6 +747,18 @@ func (p *Platform) ValidateFunctionContainersHealthiness() {
 	}
 }
 
+func (p *Platform) GetFunctionContainerName(functionConfig *functionconfig.Config) string {
+	return fmt.Sprintf("nuclio-%s-%s",
+		functionConfig.Meta.Namespace,
+		functionConfig.Meta.Name)
+}
+
+func (p *Platform) GetFunctionVolumeMountName(functionConfig *functionconfig.Config) string {
+	return fmt.Sprintf("nuclio-%s-%s",
+		functionConfig.Meta.Namespace,
+		functionConfig.Meta.Name)
+}
+
 func (p *Platform) deployFunction(createFunctionOptions *platform.CreateFunctionOptions,
 	previousHTTPPort int) (*platform.CreateFunctionResult, error) {
 
@@ -650,7 +799,7 @@ func (p *Platform) deployFunction(createFunctionOptions *platform.CreateFunction
 
 	// run the docker image
 	runContainerOptions := &dockerclient.RunOptions{
-		ContainerName: p.GetContainerNameByCreateFunctionOptions(createFunctionOptions),
+		ContainerName: p.GetFunctionContainerName(&createFunctionOptions.FunctionConfig),
 		Ports: map[int]int{
 			functionExternalHTTPPort: abstract.FunctionContainerHTTPPort,
 		},
@@ -702,9 +851,9 @@ func (p *Platform) delete(deleteFunctionOptions *platform.DeleteFunctionOptions)
 
 	getContainerOptions := &dockerclient.GetContainerOptions{
 		Labels: map[string]string{
-			"nuclio.io/platform":      "local",
-			"nuclio.io/namespace":     deleteFunctionOptions.FunctionConfig.Meta.Namespace,
-			"nuclio.io/function-name": deleteFunctionOptions.FunctionConfig.Meta.Name,
+			"nuclio.io/platform":                      "local",
+			"nuclio.io/namespace":                     deleteFunctionOptions.FunctionConfig.Meta.Namespace,
+			common.NuclioResourceLabelKeyFunctionName: deleteFunctionOptions.FunctionConfig.Meta.Name,
 		},
 	}
 
@@ -845,18 +994,6 @@ func (p *Platform) getFunctionHTTPPort(createFunctionOptions *platform.CreateFun
 	return dockerclient.RunOptionsNoPort, nil
 }
 
-func (p *Platform) GetContainerNameByCreateFunctionOptions(createFunctionOptions *platform.CreateFunctionOptions) string {
-	return fmt.Sprintf("nuclio-%s-%s",
-		createFunctionOptions.FunctionConfig.Meta.Namespace,
-		createFunctionOptions.FunctionConfig.Meta.Name)
-}
-
-func (p *Platform) GetFunctionVolumeMountName(functionConfig *functionconfig.Config) string {
-	return fmt.Sprintf("nuclio-%s-%s",
-		functionConfig.Meta.Namespace,
-		functionConfig.Meta.Name)
-}
-
 func (p *Platform) resolveDeployedFunctionHTTPPort(containerID string) (int, error) {
 	containers, err := p.dockerClient.GetContainers(&dockerclient.GetContainerOptions{
 		ID: containerID,
@@ -914,7 +1051,7 @@ func (p *Platform) deletePreviousContainers(createFunctionOptions *platform.Crea
 
 	// get function containers
 	containers, err := p.dockerClient.GetContainers(&dockerclient.GetContainerOptions{
-		Name:    p.GetContainerNameByCreateFunctionOptions(createFunctionOptions),
+		Name:    p.GetFunctionContainerName(&createFunctionOptions.FunctionConfig),
 		Stopped: true,
 	})
 	if err != nil {
@@ -1001,11 +1138,9 @@ func (p *Platform) waitForContainer(containerID string, timeout int) error {
 	p.Logger.InfoWith("Waiting for function to be ready",
 		"timeout", timeout)
 
-	var readinessTimeout time.Duration
-	if timeout != 0 {
-		readinessTimeout = time.Duration(timeout) * time.Second
-	} else {
-		readinessTimeout = abstract.DefaultReadinessTimeoutSeconds * time.Second
+	readinessTimeout := time.Duration(timeout) * time.Second
+	if timeout == 0 {
+		readinessTimeout = p.Config.GetDefaultFunctionReadinessTimeout()
 	}
 
 	if err := p.dockerClient.AwaitContainerHealth(containerID, &readinessTimeout); err != nil {
@@ -1083,10 +1218,10 @@ func (p *Platform) compileDeployFunctionEnvMap(createFunctionOptions *platform.C
 
 func (p *Platform) compileDeployFunctionLabels(createFunctionOptions *platform.CreateFunctionOptions) map[string]string {
 	labels := map[string]string{
-		"nuclio.io/platform":      "local",
-		"nuclio.io/namespace":     createFunctionOptions.FunctionConfig.Meta.Namespace,
-		"nuclio.io/function-name": createFunctionOptions.FunctionConfig.Meta.Name,
-		"nuclio.io/function-spec": p.encodeFunctionSpec(&createFunctionOptions.FunctionConfig.Spec),
+		"nuclio.io/platform":                      "local",
+		"nuclio.io/namespace":                     createFunctionOptions.FunctionConfig.Meta.Namespace,
+		common.NuclioResourceLabelKeyFunctionName: createFunctionOptions.FunctionConfig.Meta.Name,
+		"nuclio.io/function-spec":                 p.encodeFunctionSpec(&createFunctionOptions.FunctionConfig.Spec),
 	}
 
 	for labelName, labelValue := range createFunctionOptions.FunctionConfig.Meta.Labels {
@@ -1109,5 +1244,29 @@ func (p *Platform) enrichAndValidateFunctionConfig(functionConfig *functionconfi
 		return errors.Wrap(err, "Failed to validate a function configuration")
 	}
 
+	return nil
+}
+
+func (p *Platform) populateFunctionInvocationStatus(functionInvocation *functionconfig.Status,
+	createFunctionResults *platform.CreateFunctionResult) error {
+
+	externalIPAddresses, err := p.GetExternalIPAddresses()
+	if err != nil {
+		return err
+	}
+
+	addresses, err := p.dockerClient.GetContainerIPAddresses(createFunctionResults.ContainerID)
+	if err != nil {
+		return errors.Wrap(err, "Failed to get container network addresses")
+	}
+
+	functionInvocation.InternalInvocationURLs = addresses
+	functionInvocation.ExternalInvocationURLs = []string{}
+	for _, externalIPAddress := range externalIPAddresses {
+		if externalIPAddress != "" {
+			functionInvocation.ExternalInvocationURLs = append(functionInvocation.ExternalInvocationURLs,
+				fmt.Sprintf("%s:%d", externalIPAddress, createFunctionResults.Port))
+		}
+	}
 	return nil
 }

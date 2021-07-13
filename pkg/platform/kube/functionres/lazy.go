@@ -87,6 +87,7 @@ type lazyClient struct {
 	nuclioClientSet               nuclioioclient.Interface
 	classLabels                   labels.Set
 	platformConfigurationProvider PlatformConfigurationProvider
+	nginxIngressUpdateGracePeriod time.Duration
 }
 
 func NewLazyClient(parentLogger logger.Logger,
@@ -94,10 +95,11 @@ func NewLazyClient(parentLogger logger.Logger,
 	nuclioClientSet nuclioioclient.Interface) (Client, error) {
 
 	newClient := lazyClient{
-		logger:          parentLogger.GetChild("functionres"),
-		kubeClientSet:   kubeClientSet,
-		nuclioClientSet: nuclioClientSet,
-		classLabels:     make(labels.Set),
+		logger:                        parentLogger.GetChild("functionres"),
+		kubeClientSet:                 kubeClientSet,
+		nuclioClientSet:               nuclioClientSet,
+		classLabels:                   make(labels.Set),
+		nginxIngressUpdateGracePeriod: nginxIngressUpdateGracePeriod,
 	}
 
 	newClient.initClassLabels()
@@ -159,7 +161,9 @@ func (lc *lazyClient) Get(ctx context.Context, namespace string, name string) (R
 	}, err
 }
 
-func (lc *lazyClient) CreateOrUpdate(ctx context.Context, function *nuclioio.NuclioFunction, imagePullSecrets string) (Resources, error) {
+func (lc *lazyClient) CreateOrUpdate(ctx context.Context,
+	function *nuclioio.NuclioFunction,
+	imagePullSecrets string) (Resources, error) {
 	var err error
 
 	// get labels from the function and add class labels
@@ -232,7 +236,9 @@ func (lc *lazyClient) CreateOrUpdate(ctx context.Context, function *nuclioio.Nuc
 		}
 	}
 
-	lc.logger.DebugWith("Successfully created/updated resources", "functionName", function.Name)
+	lc.logger.DebugWith("Successfully created/updated resources",
+		"functionName", function.Name,
+		"functionNamespace", function.Namespace)
 	return &resources, nil
 }
 
@@ -723,7 +729,7 @@ func (lc *lazyClient) createOrUpdateDeployment(functionLabels labels.Set,
 
 	createDeployment := func() (interface{}, error) {
 		method := createDeploymentResourceMethod
-		container := v1.Container{Name: "nuclio"}
+		container := v1.Container{Name: client.FunctionContainerName}
 		lc.populateDeploymentContainer(functionLabels, function, &container)
 		container.VolumeMounts = volumeMounts
 
@@ -749,6 +755,9 @@ func (lc *lazyClient) createOrUpdateDeployment(functionLabels labels.Set,
 					Volumes:            volumes,
 					ServiceAccountName: function.Spec.ServiceAccount,
 					SecurityContext:    function.Spec.SecurityContext,
+					Affinity:           function.Spec.Affinity,
+					NodeSelector:       function.Spec.NodeSelector,
+					NodeName:           function.Spec.NodeName,
 				},
 			},
 		}
@@ -812,6 +821,10 @@ func (lc *lazyClient) createOrUpdateDeployment(functionLabels labels.Set,
 		if function.Spec.ServiceAccount != "" {
 			deployment.Spec.Template.Spec.ServiceAccountName = function.Spec.ServiceAccount
 		}
+
+		deployment.Spec.Template.Spec.Affinity = function.Spec.Affinity
+		deployment.Spec.Template.Spec.NodeSelector = function.Spec.NodeSelector
+		deployment.Spec.Template.Spec.NodeName = function.Spec.NodeName
 
 		// enrich deployment spec with default fields that were passed inside the platform configuration
 		// performed on update too, in case the platform config has been modified after the creation of this deployment
@@ -1274,10 +1287,11 @@ func (lc *lazyClient) compileCronTriggerNotInSliceLabels(slice []string) (string
 // nginx ingress controller might need a grace period to stabilize after an update, otherwise it might respond with 503
 func (lc *lazyClient) waitForNginxIngressToStabilize(ingress *extv1beta1.Ingress) {
 	lc.logger.DebugWith("Waiting for nginx ingress to stabilize",
-		"nginxIngressUpdateGracePeriod", nginxIngressUpdateGracePeriod,
+		"nginxIngressUpdateGracePeriod", lc.nginxIngressUpdateGracePeriod,
 		"ingressNamespace", ingress.Namespace,
 		"ingressName", ingress.Name)
-	time.Sleep(nginxIngressUpdateGracePeriod)
+
+	time.Sleep(lc.nginxIngressUpdateGracePeriod)
 	lc.logger.DebugWith("Finished waiting for nginx ingress to stabilize",
 		"ingressNamespace", ingress.Namespace,
 		"ingressName", ingress.Name)
@@ -1657,16 +1671,35 @@ func (lc *lazyClient) populateIngressConfig(functionLabels labels.Set,
 	meta.Annotations["nginx.ingress.kubernetes.io/configuration-snippet"] = fmt.Sprintf(
 		`proxy_set_header X-Nuclio-Target "%s";`, function.Name)
 
+	// Check if function is a scale to zero candidate
+	//			is not disabled
+	//			is not in imported state
+	//			has minimum replicas == 0
+	//			has maximum replicas >  0
+	if !function.Spec.Disable &&
+		function.Status.State != functionconfig.FunctionStateImported &&
+		function.GetComputedMinReplicas() == 0 &&
+		function.GetComputedMaxReplicas() > 0 {
+		platformConfiguration := lc.platformConfigurationProvider.GetPlatformConfiguration()
+
+		// enrich if not exists
+		for key, value := range platformConfiguration.ScaleToZero.HTTPTriggerIngressAnnotations {
+			if _, ok := meta.Annotations[key]; !ok {
+				meta.Annotations[key] = value
+			}
+		}
+	}
+
 	// clear out existing so that we don't keep adding rules
 	spec.Rules = []extv1beta1.IngressRule{}
 	spec.TLS = []extv1beta1.IngressTLS{}
 
-	for _, ingress := range functionconfig.GetIngressesFromTriggers(function.Spec.Triggers) {
+	ingresses := functionconfig.GetFunctionIngresses(client.NuclioioToFunctionConfig(function))
+	for _, ingress := range ingresses {
 		if err := lc.addIngressToSpec(&ingress, functionLabels, function, spec); err != nil {
 			return errors.Wrap(err, "Failed to add ingress to spec")
 		}
 	}
-
 	return nil
 }
 
@@ -1990,6 +2023,7 @@ func (lc *lazyClient) deleteFunctionEvents(ctx context.Context, functionName str
 	lc.logger.DebugWith("Got function events", "num", len(result.Items))
 
 	for _, functionEvent := range result.Items {
+		functionEvent := functionEvent
 		errGroup.Go(func() error {
 			err = lc.nuclioClientSet.NuclioV1beta1().
 				NuclioFunctionEvents(namespace).

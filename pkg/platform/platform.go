@@ -18,10 +18,13 @@ package platform
 
 import (
 	"bufio"
+	"context"
+	"io"
 	"time"
 
 	"github.com/nuclio/nuclio/pkg/containerimagebuilderpusher"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/processor/build/runtime"
 )
@@ -71,8 +74,17 @@ type Platform interface {
 	// GetFunctions will list existing functions
 	GetFunctions(getFunctionsOptions *GetFunctionsOptions) ([]Function, error)
 
+	// FilterFunctionsByPermissions will filter out some functions
+	FilterFunctionsByPermissions(*opa.PermissionOptions, []Function) ([]Function, error)
+
 	// GetDefaultInvokeIPAddresses will return a list of ip addresses to be used by the platform to invoke a function
 	GetDefaultInvokeIPAddresses() ([]string, error)
+
+	// GetFunctionReplicaLogsStream return the function instance (Kubernetes - Pod / Docker - Container) logs stream
+	GetFunctionReplicaLogsStream(context.Context, *GetFunctionReplicaLogsStreamOptions) (io.ReadCloser, error)
+
+	// GetFunctionReplicaNames returns function replica names (Pod / Container names)
+	GetFunctionReplicaNames(context.Context, *functionconfig.Config) ([]string, error)
 
 	//
 	// Project
@@ -90,10 +102,10 @@ type Platform interface {
 	// GetProjects will list existing projects
 	GetProjects(getProjectsOptions *GetProjectsOptions) ([]Project, error)
 
-	// Ensures default project exists, creates it otherwise
+	// EnsureDefaultProjectExistence ensure default project exists, creates it otherwise
 	EnsureDefaultProjectExistence() error
 
-	// Waits for all of the project's resources to be deleted
+	// WaitForProjectResourcesDeletion waits for all of the project's resources to be deleted
 	WaitForProjectResourcesDeletion(projectMeta *ProjectMeta, duration time.Duration) error
 
 	//
@@ -113,11 +125,14 @@ type Platform interface {
 	// GetFunctionEvents will list existing function events
 	GetFunctionEvents(getFunctionEventsOptions *GetFunctionEventsOptions) ([]FunctionEvent, error)
 
+	// FilterFunctionEventsByPermissions will filter out some function events
+	FilterFunctionEventsByPermissions(*opa.PermissionOptions, []FunctionEvent) ([]FunctionEvent, error)
+
 	//
 	// API Gateway
 	//
 
-	// Create APIGateway creates and deploys a new api gateway
+	// CreateAPIGateway creates and deploy APIGateway
 	CreateAPIGateway(createAPIGatewayOptions *CreateAPIGatewayOptions) error
 
 	// UpdateAPIGateway will update a previously deployed api gateway
@@ -140,10 +155,6 @@ type Platform interface {
 	// GetExternalIPAddresses returns the external IP addresses invocations will use, if "via" is set to "external-ip".
 	// These addresses are either set through SetExternalIPAddresses or automatically discovered
 	GetExternalIPAddresses() ([]string, error)
-
-	SetDefaultHTTPIngressHostTemplate(string)
-
-	GetDefaultHTTPIngressHostTemplate() string
 
 	SetImageNamePrefixTemplate(string)
 
@@ -201,4 +212,14 @@ type Platform interface {
 
 	// GetRuntimeBuildArgs returns the runtime specific build arguments
 	GetRuntimeBuildArgs(runtime runtime.Runtime) map[string]string
+
+	//
+	// OPA
+	//
+
+	// QueryOPAFunctionPermissions queries opa permissions for a certain function
+	QueryOPAFunctionPermissions(projectName, functionName string, action opa.Action, permissionOptions *opa.PermissionOptions) (bool, error)
+
+	// QueryOPAFunctionEventPermissions queries opa permissions for a certain function event
+	QueryOPAFunctionEventPermissions(projectName, functionName, functionEventName string, action opa.Action, permissionOptions *opa.PermissionOptions) (bool, error)
 }

@@ -26,6 +26,8 @@ import (
 	machinarymetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const DefaultFunctionReadinessTimeoutSeconds = 60
+
 type LoggerSink struct {
 	Kind       string                 `json:"kind,omitempty"`
 	URL        string                 `json:"url,omitempty"`
@@ -71,6 +73,9 @@ type ScaleToZero struct {
 	ResourceReadinessTimeout string                         `json:"resourceReadinessTimeout,omitempty"`
 	ScaleResources           []functionconfig.ScaleResource `json:"scaleResources,omitempty"`
 	InactivityWindowPresets  []string                       `json:"inactivityWindowPresets,omitempty"`
+
+	// Used to enrich special scale-to-zero ingress annotations
+	HTTPTriggerIngressAnnotations map[string]string `json:"httpTriggerIngressAnnotations,omitempty"`
 }
 
 type ScaleToZeroMode string
@@ -106,18 +111,22 @@ type ProjectsLeaderKind string
 const (
 	ProjectsLeaderKindIguazio ProjectsLeaderKind = "iguazio"
 	ProjectsLeaderKindMlrun   ProjectsLeaderKind = "mlrun"
+	ProjectsLeaderKindMock    ProjectsLeaderKind = "mock"
 )
 
 type ProjectsLeader struct {
-	URL  string             `json:"url,omitempty"`
-	Kind ProjectsLeaderKind `json:"kind,omitempty"`
+	Kind                    ProjectsLeaderKind `json:"kind,omitempty"`
+	APIAddress              string             `json:"apiAddress,omitempty"`
+	SynchronizationInterval string             `json:"synchronizationInterval,omitempty"`
 }
 
 type PlatformKubeConfig struct {
 	KubeConfigPath string `json:"kubeConfigPath,omitempty"`
 
 	// TODO: Move IngressConfig here
-	DefaultServiceType corev1.ServiceType `json:"defaultServiceType,omitempty"`
+	DefaultServiceType             corev1.ServiceType `json:"defaultServiceType,omitempty"`
+	DefaultFunctionNodeSelector    map[string]string  `json:"defaultFunctionNodeSelector,omitempty"`
+	DefaultHTTPIngressHostTemplate string             `json:"defaultHTTPIngressHostTemplate,omitempty"`
 }
 
 type PlatformLocalConfig struct {
@@ -133,7 +142,7 @@ type ImageRegistryOverridesConfig struct {
 	OnbuildImageRegistries map[string]string `json:"onbuildImageRegistries,omitempty"`
 }
 
-// default values for created ingresses
+// IngressConfig holds the default values for created ingresses
 type IngressConfig struct {
 	EnableSSLRedirect          bool     `json:"enableSSLRedirect,omitempty"`
 	TLSSecret                  string   `json:"tlsSecret,omitempty"`

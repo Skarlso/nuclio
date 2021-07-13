@@ -28,6 +28,7 @@ import (
 	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/dashboard"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/platform"
 	"github.com/nuclio/nuclio/pkg/restful"
 
@@ -56,20 +57,9 @@ func (fr *functionResource) GetAll(request *http.Request) (map[string]restful.At
 		return nil, nuclio.NewErrBadRequest("Namespace must exist")
 	}
 
-	// TODO: enrich with api gateways only if given by header
-	getFunctionsOptions := &platform.GetFunctionsOptions{
-		Name:                  request.Header.Get("x-nuclio-function-name"),
-		Namespace:             fr.getNamespaceFromRequest(request),
-		EnrichWithAPIGateways: fr.headerValueIsTrue(request, "x-nuclio-function-enrich-apigateways"),
-	}
-
-	// if the user wants to filter by project, do that
-	projectNameFilter := request.Header.Get("x-nuclio-project-name")
-	if projectNameFilter != "" {
-		getFunctionsOptions.Labels = fmt.Sprintf("nuclio.io/project-name=%s", projectNameFilter)
-	}
-
-	functions, err := fr.getPlatform().GetFunctions(getFunctionsOptions)
+	functionName := request.Header.Get("x-nuclio-function-name")
+	getFunctionOptions := fr.resolveGetFunctionOptionsFromRequest(request, functionName, false)
+	functions, err := fr.getPlatform().GetFunctions(getFunctionOptions)
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to get functions")
 	}
@@ -91,30 +81,19 @@ func (fr *functionResource) GetAll(request *http.Request) (map[string]restful.At
 // GetByID returns a specific function by id
 func (fr *functionResource) GetByID(request *http.Request, id string) (restful.Attributes, error) {
 
-	// get namespace
+	// get and validate namespace
 	namespace := fr.getNamespaceFromRequest(request)
 	if namespace == "" {
 		return nil, nuclio.NewErrBadRequest("Namespace must exist")
 	}
 
-	// TODO: enrich with api gateways only if given by header
-	functions, err := fr.getPlatform().GetFunctions(&platform.GetFunctionsOptions{
-		Namespace:             fr.getNamespaceFromRequest(request),
-		Name:                  id,
-		EnrichWithAPIGateways: fr.headerValueIsTrue(request, "x-nuclio-function-enrich-apigateways"),
-	})
-
+	// get function
+	function, err := fr.getFunction(request, id)
 	if err != nil {
-		return nil, errors.Wrap(err, "Failed to get functions")
+		return nil, errors.Wrap(err, "Failed to get get function")
 	}
 
-	if len(functions) == 0 {
-		return nil, nuclio.NewErrNotFound("Function not found")
-	}
-	function := functions[0]
-
-	exportFunction := fr.GetURLParamBoolOrDefault(request, restful.ParamExport, false)
-	if exportFunction {
+	if fr.GetURLParamBoolOrDefault(request, restful.ParamExport, false) {
 		return fr.export(function), nil
 	}
 
@@ -133,6 +112,11 @@ func (fr *functionResource) Create(request *http.Request) (id string, attributes
 	functions, err := fr.getPlatform().GetFunctions(&platform.GetFunctionsOptions{
 		Name:      functionInfo.Meta.Name,
 		Namespace: fr.resolveNamespace(request, functionInfo),
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			RaiseForbidden:      true,
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	})
 	if err != nil {
 		responseErr = nuclio.WrapErrInternalServerError(errors.Wrap(err, "Failed to get functions"))
@@ -152,7 +136,7 @@ func (fr *functionResource) Create(request *http.Request) (id string, attributes
 	waitForFunction := fr.headerValueIsTrue(request, "x-nuclio-wait-function-action")
 
 	// validation finished successfully - store and deploy the given function
-	if responseErr = fr.storeAndDeployFunction(functionInfo, authConfig, waitForFunction); responseErr != nil {
+	if responseErr = fr.storeAndDeployFunction(request, functionInfo, authConfig, waitForFunction); responseErr != nil {
 		return
 	}
 
@@ -172,6 +156,11 @@ func (fr *functionResource) Update(request *http.Request, id string) (attributes
 	functions, err := fr.getPlatform().GetFunctions(&platform.GetFunctionsOptions{
 		Name:      functionInfo.Meta.Name,
 		Namespace: fr.resolveNamespace(request, functionInfo),
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			RaiseForbidden:      true,
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	})
 	if err != nil {
 		responseErr = nuclio.WrapErrInternalServerError(errors.Wrap(err, "Failed to get functions"))
@@ -195,14 +184,14 @@ func (fr *functionResource) Update(request *http.Request, id string) (attributes
 
 	waitForFunction := fr.headerValueIsTrue(request, "x-nuclio-wait-function-action")
 
-	if responseErr = fr.storeAndDeployFunction(functionInfo, authConfig, waitForFunction); responseErr != nil {
+	if responseErr = fr.storeAndDeployFunction(request, functionInfo, authConfig, waitForFunction); responseErr != nil {
 		return
 	}
 
 	return nil, nuclio.ErrAccepted
 }
 
-// returns a list of custom routes for the resource
+// GetCustomRoutes returns a list of custom routes for the resource
 func (fr *functionResource) GetCustomRoutes() ([]restful.CustomRoute, error) {
 
 	// since delete and update by default assume /resource/{id} and we want to get the id/namespace from the body
@@ -212,6 +201,17 @@ func (fr *functionResource) GetCustomRoutes() ([]restful.CustomRoute, error) {
 			Pattern:   "/",
 			Method:    http.MethodDelete,
 			RouteFunc: fr.deleteFunction,
+		},
+		{
+			Pattern:   "/{id}/replicas",
+			Method:    http.MethodGet,
+			RouteFunc: fr.getFunctionReplicas,
+		},
+		{
+			Pattern:         "/{id}/logs/{replicaName}",
+			Method:          http.MethodGet,
+			StreamRouteFunc: fr.getFunctionLogs,
+			Stream:          true,
 		},
 	}, nil
 }
@@ -232,7 +232,10 @@ func (fr *functionResource) export(function platform.Function) restful.Attribute
 	return attributes
 }
 
-func (fr *functionResource) storeAndDeployFunction(functionInfo *functionInfo, authConfig *platform.AuthConfig, waitForFunction bool) error {
+func (fr *functionResource) storeAndDeployFunction(request *http.Request,
+	functionInfo *functionInfo,
+	authConfig *platform.AuthConfig,
+	waitForFunction bool) error {
 
 	creationStateUpdatedTimeout := 45 * time.Second
 
@@ -275,6 +278,10 @@ func (fr *functionResource) storeAndDeployFunction(functionInfo *functionInfo, a
 			CreationStateUpdated:       creationStateUpdatedChan,
 			AuthConfig:                 authConfig,
 			DependantImagesRegistryURL: fr.GetServer().(*dashboard.Server).GetDependantImagesRegistryURL(),
+			PermissionOptions: opa.PermissionOptions{
+				MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+				OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+			},
 		})
 
 		if err != nil {
@@ -305,6 +312,106 @@ func (fr *functionResource) storeAndDeployFunction(functionInfo *functionInfo, a
 	return nil
 }
 
+func (fr *functionResource) getFunctionLogs(request *http.Request) (*restful.CustomRouteFuncStreamResponse, error) {
+
+	// ensure namespace
+	namespace := fr.getNamespaceFromRequest(request)
+	if namespace == "" {
+		return nil, nuclio.NewErrBadRequest("Namespace must exist")
+	}
+
+	// ensure function name
+	functionName := fr.GetRouterURLParam(request, "id")
+	if functionName == "" {
+		return nil, errors.New("Function name must not be empty")
+	}
+
+	// ensure replica name
+	functionReplicaName := fr.GetRouterURLParam(request, "replicaName")
+	if functionReplicaName == "" {
+		return nil, errors.New("Function instance must not be empty")
+	}
+
+	// populate get options
+	getFunctionReplicaLogsStreamOptions, err := fr.populateGetFunctionReplicaLogsStreamOptions(request,
+		functionReplicaName,
+		namespace)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to populate get function replica logs stream options")
+	}
+
+	// get function
+	function, err := fr.getFunction(request, functionName)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get function")
+	}
+
+	replicaNames, err := fr.getPlatform().GetFunctionReplicaNames(request.Context(), function.GetConfig())
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get function replica names")
+	}
+
+	// ensure replica belongs to function
+	if !common.StringSliceContainsStringCaseInsensitive(replicaNames, functionReplicaName) {
+		return nil, nuclio.NewErrBadRequest(fmt.Sprintf("%s replica does not belong to function %s",
+			functionReplicaName,
+			function.GetConfig().Meta.Name))
+	}
+
+	// get function instance logs stream
+	stream, err := fr.getPlatform().GetFunctionReplicaLogsStream(request.Context(), getFunctionReplicaLogsStreamOptions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to stream function logs")
+	}
+
+	return &restful.CustomRouteFuncStreamResponse{
+		ReadCloser: stream,
+		StatusCode: http.StatusOK,
+		Headers: map[string]string{
+			"Content-Type":  "text/plain",
+			"Cache-Control": "no-cache, private",
+		},
+		ForceFlush:    true,
+		FlushInternal: time.Second,
+	}, nil
+}
+
+func (fr *functionResource) getFunctionReplicas(request *http.Request) (
+	*restful.CustomRouteFuncResponse, error) {
+
+	// ensure namespace
+	namespace := fr.getNamespaceFromRequest(request)
+	if namespace == "" {
+		return nil, nuclio.NewErrBadRequest("Namespace must exist")
+	}
+
+	// ensure function name
+	functionName := fr.GetRouterURLParam(request, "id")
+	if functionName == "" {
+		return nil, errors.New("Function name must not be empty")
+	}
+
+	function, err := fr.getFunction(request, functionName)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get function")
+	}
+
+	replicaNames, err := fr.getPlatform().GetFunctionReplicaNames(request.Context(), function.GetConfig())
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get function replicas")
+	}
+	return &restful.CustomRouteFuncResponse{
+		Resources: map[string]restful.Attributes{
+			"replicas": map[string]interface{}{
+				"names": replicaNames,
+			},
+		},
+		Single:     true,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		StatusCode: http.StatusOK,
+	}, nil
+}
+
 func (fr *functionResource) deleteFunction(request *http.Request) (*restful.CustomRouteFuncResponse, error) {
 
 	// get function config and status from body
@@ -329,6 +436,10 @@ func (fr *functionResource) deleteFunction(request *http.Request) (*restful.Cust
 
 	deleteFunctionOptions := platform.DeleteFunctionOptions{
 		AuthConfig: authConfig,
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	}
 
 	deleteFunctionOptions.FunctionConfig.Meta = *functionInfo.Meta
@@ -404,6 +515,42 @@ func (fr *functionResource) validateUpdateInfo(functionInfo *functionInfo, funct
 	return nil
 }
 
+func (fr *functionResource) getFunction(request *http.Request, name string) (platform.Function, error) {
+	getFunctionOptions := fr.resolveGetFunctionOptionsFromRequest(request, name, true)
+	functions, err := fr.getPlatform().GetFunctions(getFunctionOptions)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get functions")
+	}
+
+	if len(functions) == 0 {
+		return nil, nuclio.NewErrNotFound("Function not found")
+	}
+	return functions[0], nil
+}
+
+func (fr *functionResource) resolveGetFunctionOptionsFromRequest(request *http.Request,
+	functionName string,
+	raiseForbidden bool) *platform.GetFunctionsOptions {
+
+	getFunctionsOptions := &platform.GetFunctionsOptions{
+		Namespace:             fr.getNamespaceFromRequest(request),
+		Name:                  functionName,
+		EnrichWithAPIGateways: fr.headerValueIsTrue(request, "x-nuclio-function-enrich-apigateways"),
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			RaiseForbidden:      raiseForbidden,
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
+	}
+
+	// if the user wants to filter by project, do that
+	projectNameFilter := request.Header.Get("x-nuclio-project-name")
+	if projectNameFilter != "" {
+		getFunctionsOptions.Labels = fmt.Sprintf("nuclio.io/project-name=%s", projectNameFilter)
+	}
+	return getFunctionsOptions
+}
+
 func (fr *functionResource) processFunctionInfo(functionInfoInstance *functionInfo, projectName string) (
 	*functionInfo, error) {
 
@@ -449,6 +596,41 @@ func (fr *functionResource) processFunctionInfo(functionInfoInstance *functionIn
 	}
 
 	return functionInfoInstance, nil
+}
+
+func (fr *functionResource) populateGetFunctionReplicaLogsStreamOptions(request *http.Request,
+	replicaName string,
+	namespace string) (*platform.GetFunctionReplicaLogsStreamOptions, error) {
+
+	getFunctionReplicaLogsStreamOptions := &platform.GetFunctionReplicaLogsStreamOptions{
+		Name:      replicaName,
+		Namespace: namespace,
+		Follow:    fr.GetURLParamBoolOrDefault(request, "follow", true),
+	}
+
+	// populate since seconds
+	sinceStr := fr.GetURLParamStringOrDefault(request, "since", "")
+	if sinceStr != "" {
+		since, err := time.ParseDuration(sinceStr)
+		if err != nil {
+			return nil, errors.Wrap(err, "Failed to parse sinceSeconds")
+		}
+		sinceSeconds := int64(since.Seconds())
+		getFunctionReplicaLogsStreamOptions.SinceSeconds = &sinceSeconds
+	} else {
+		getFunctionReplicaLogsStreamOptions.SinceSeconds = nil
+	}
+
+	// populate since seconds
+	tailLines := fr.GetURLParamInt64OrDefault(request, "tailLines", -1)
+	if tailLines != -1 {
+		getFunctionReplicaLogsStreamOptions.TailLines = &tailLines
+	} else {
+		getFunctionReplicaLogsStreamOptions.TailLines = nil
+	}
+
+	return getFunctionReplicaLogsStreamOptions, nil
+
 }
 
 // register the resource

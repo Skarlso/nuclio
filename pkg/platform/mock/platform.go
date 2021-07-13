@@ -2,10 +2,13 @@ package mock
 
 import (
 	"bufio"
+	"context"
+	"io"
 	"time"
 
 	"github.com/nuclio/nuclio/pkg/containerimagebuilderpusher"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/platform"
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/processor/build/runtime"
@@ -81,6 +84,24 @@ func (mp *Platform) CreateFunctionInvocation(createFunctionInvocationOptions *pl
 func (mp *Platform) GetFunctions(getFunctionsOptions *platform.GetFunctionsOptions) ([]platform.Function, error) {
 	args := mp.Called(getFunctionsOptions)
 	return args.Get(0).([]platform.Function), args.Error(1)
+}
+
+func (mp *Platform) FilterFunctionsByPermissions(permissionOptions *opa.PermissionOptions,
+	functions []platform.Function) ([]platform.Function, error) {
+	args := mp.Called(permissionOptions, functions)
+	return args.Get(0).([]platform.Function), args.Error(1)
+}
+
+// GetFunctionReplicaLogsStream return the function instance (Kubernetes - Pod / Docker - Container) logs stream
+func (mp *Platform) GetFunctionReplicaLogsStream(ctx context.Context, options *platform.GetFunctionReplicaLogsStreamOptions) (io.ReadCloser, error) {
+	args := mp.Called(ctx, options)
+	return args.Get(0).(io.ReadCloser), args.Error(1)
+}
+
+// GetFunctionReplicaNames returns function replica names (Pod / Container names)
+func (mp *Platform) GetFunctionReplicaNames(ctx context.Context, functionConfig *functionconfig.Config) ([]string, error) {
+	args := mp.Called(ctx, functionConfig)
+	return args.Get(0).([]string), args.Error(1)
 }
 
 //
@@ -173,18 +194,15 @@ func (mp *Platform) GetFunctionEvents(getFunctionEventsOptions *platform.GetFunc
 	return args.Get(0).([]platform.FunctionEvent), args.Error(1)
 }
 
+func (mp *Platform) FilterFunctionEventsByPermissions(permissionOptions *opa.PermissionOptions,
+	functionEvents []platform.FunctionEvent) ([]platform.FunctionEvent, error) {
+	args := mp.Called(permissionOptions, functionEvents)
+	return args.Get(0).([]platform.FunctionEvent), args.Error(1)
+}
+
 //
 // Misc
 //
-
-func (mp *Platform) SetDefaultHTTPIngressHostTemplate(defaultHTTPIngressHostTemplate string) {
-	mp.Called(defaultHTTPIngressHostTemplate)
-}
-
-func (mp *Platform) GetDefaultHTTPIngressHostTemplate() string {
-	args := mp.Called()
-	return args.Get(0).(string)
-}
 
 func (mp *Platform) SetImageNamePrefixTemplate(imageNamePrefixTemplate string) {
 	mp.Called(imageNamePrefixTemplate)
@@ -301,4 +319,21 @@ func (mp *Platform) GetProcessorLogsAndBriefError(scanner *bufio.Scanner) (strin
 
 func (mp *Platform) WaitForProjectResourcesDeletion(projectMeta *platform.ProjectMeta, duration time.Duration) error {
 	return nil
+}
+
+func (mp *Platform) QueryOPAFunctionPermissions(projectName,
+	functionName string,
+	action opa.Action,
+	permissionOptions *opa.PermissionOptions) (bool, error) {
+	args := mp.Called(projectName, functionName, action, permissionOptions)
+	return args.Get(0).(bool), args.Error(1)
+}
+
+func (mp *Platform) QueryOPAFunctionEventPermissions(projectName,
+	functionName,
+	functionEventName string,
+	action opa.Action,
+	permissionOptions *opa.PermissionOptions) (bool, error) {
+	args := mp.Called(projectName, functionName, functionEventName, action, permissionOptions)
+	return args.Get(0).(bool), args.Error(1)
 }

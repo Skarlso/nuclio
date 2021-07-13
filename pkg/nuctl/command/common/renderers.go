@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/nuclio/nuclio/pkg/common"
@@ -49,7 +50,8 @@ func RenderFunctions(logger logger.Logger,
 		if format == OutputFormatWide {
 			header = append(header, []string{
 				"Labels",
-				"Ingresses",
+				"Internal Invocation URL",
+				"External Invocation URLs",
 			}...)
 		}
 
@@ -73,7 +75,8 @@ func RenderFunctions(logger logger.Logger,
 			if format == OutputFormatWide {
 				functionFields = append(functionFields, []string{
 					common.StringMapToString(function.GetConfig().Meta.Labels),
-					FormatFunctionIngresses(function),
+					strings.Join(function.GetStatus().InternalInvocationURLs, ", "),
+					strings.Join(function.GetStatus().ExternalInvocationURLs, ", "),
 				}...)
 			}
 
@@ -213,13 +216,13 @@ func RenderAPIGateways(apiGateways []platform.APIGateway,
 		for _, apiGateway := range apiGateways {
 
 			// primary function
-			primaryFunction := apiGateway.GetConfig().Spec.Upstreams[0].Nucliofunction.Name
+			primaryFunction := apiGateway.GetConfig().Spec.Upstreams[0].NuclioFunction.Name
 
 			// get canaryFunction if it exists
 			canaryFunction := ""
 			canaryPercentage := 0
 			if len(apiGateway.GetConfig().Spec.Upstreams) == 2 {
-				canaryFunction = apiGateway.GetConfig().Spec.Upstreams[1].Nucliofunction.Name
+				canaryFunction = apiGateway.GetConfig().Spec.Upstreams[1].NuclioFunction.Name
 				canaryPercentage = apiGateway.GetConfig().Spec.Upstreams[1].Percentage
 			}
 

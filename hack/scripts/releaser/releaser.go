@@ -91,18 +91,28 @@ func NewRelease(cmdRunner cmdrunner.CmdRunner, logger logger.Logger) *Release {
 }
 
 func (r *Release) Run() error {
+
+	// do the cloning, fetch tags, etc
 	if err := r.prepareRepository(); err != nil {
 		return errors.Wrap(err, "Failed to ensure repository")
 	}
 
-	if err := r.populateCurrentAndTargetVersions(); err != nil {
-		return errors.Wrap(err, "Failed to populate current and target versions")
-	}
-
+	// merge development branch onto the release branch (e.g. development -> master)
 	if err := r.mergeAndPush(r.releaseBranch, r.developmentBranch); err != nil {
 		return errors.Wrap(err, "Failed to sync release and development branches")
 	}
 
+	// read the helm chart and populate its values for target version determination
+	if err := r.populateHelmChartConfig(); err != nil {
+		return errors.Wrap(err, "Failed to populate helm chart config")
+	}
+
+	// set current and target versions
+	if err := r.populateCurrentAndTargetVersions(); err != nil {
+		return errors.Wrap(err, "Failed to populate current and target versions")
+	}
+
+	// nuclio services release (github release, images, binaries, etc)
 	if !r.skipCreateRelease {
 		if err := r.runAndRetrySkipIfFailed(r.createRelease,
 			"Waiting for release creation has failed"); err != nil {
@@ -117,6 +127,7 @@ func (r *Release) Run() error {
 		r.logger.Info("Skipping release creation")
 	}
 
+	// helm chart release
 	if !r.skipBumpHelmChart {
 		if err := r.bumpHelmChartVersion(); err != nil {
 			return errors.Wrap(err, "Failed to bump helm chart version")
@@ -125,6 +136,7 @@ func (r *Release) Run() error {
 		r.logger.Info("Skipping bump helm chart")
 	}
 
+	r.logger.Info("Release is now done")
 	return nil
 }
 
@@ -189,7 +201,7 @@ func (r *Release) prepareRepository() error {
 		return errors.Wrap(err, "Failed to fetch tags")
 	}
 
-	return r.populateHelmChartConfig()
+	return nil
 }
 
 func (r *Release) populateHelmChartConfig() error {
@@ -234,14 +246,22 @@ func (r *Release) populateCurrentAndTargetVersions() error {
 
 	// target version is empty, prompt user for an input
 	if r.targetVersion.Equal(semver.Version{}) {
-		reader := bufio.NewReader(os.Stdin)
-		fmt.Printf("Target version (Current version: %s, Press enter to continue): ",
-			r.currentVersion)
-		targetVersion, err := reader.ReadString('\n')
-		if err != nil {
-			return errors.Wrap(err, "Failed to read target version from stdin")
+
+		// we do not intend to create a release and hence preserving the current target version
+		if r.skipCreateRelease {
+			r.targetVersion = r.currentVersion
+		} else {
+
+			// read as input
+			reader := bufio.NewReader(os.Stdin)
+			fmt.Printf("Target version (Current version: %s, Press enter to continue): ",
+				r.currentVersion)
+			targetVersion, err := reader.ReadString('\n')
+			if err != nil {
+				return errors.Wrap(err, "Failed to read target version from stdin")
+			}
+			r.targetVersion = semver.New(strings.TrimSpace(targetVersion))
 		}
-		r.targetVersion = semver.New(strings.TrimSpace(targetVersion))
 	}
 
 	// helm charts target version is empty, prompt user for an input
@@ -310,15 +330,6 @@ func (r *Release) mergeAndPush(branch string, branchToMerge string) error {
 	}
 
 	return nil
-}
-
-func (r *Release) getReleaseStatus() (string, error) {
-	switch r.releaseBranch {
-	case "1.1.x":
-		return r.getTravisReleaseStatus()
-	default:
-		return r.getGithubWorkflowsReleaseStatus()
-	}
 }
 
 func (r *Release) getGithubWorkflowsReleaseStatus() (string, error) {
@@ -534,7 +545,7 @@ func (r *Release) createRelease() error {
 	return common.RetryUntilSuccessful(time.Minute*5,
 		time.Second*5,
 		func() bool {
-			status, err := r.getReleaseStatus()
+			status, err := r.getGithubWorkflowsReleaseStatus()
 			if err != nil {
 				r.logger.DebugWith("Get release status returned with an error", "err", err)
 				return false
@@ -548,26 +559,21 @@ func (r *Release) waitForReleaseCompleteness() error {
 	return common.RetryUntilSuccessful(time.Minute*60,
 		time.Minute*1,
 		func() bool {
-			status, err := r.getReleaseStatus()
+			status, err := r.getGithubWorkflowsReleaseStatus()
 			if err != nil {
 				r.logger.DebugWith("Get release status returned with an error", "err", err)
 				return false
 			}
 
 			r.logger.DebugWith("Waiting for release completeness", "status", status)
-			switch r.releaseBranch {
-			case "1.1.x":
-				return status == "finished"
-			default:
-				if status == "failure" {
-					r.logger.Warn(`Release job has failed, checkout its job status from 
+			if status == "failure" {
+				r.logger.Warn(`Release job has failed, checkout its job status from 
 https://github.com/nuclio/nuclio/actions?query=workflow%3ARelease
 Once re-run, it will catch up here.`)
-				}
-
-				// TODO: handle failure/cancelled from here? or let it run as suggested above
-				return status == "success"
 			}
+
+			// TODO: handle failure/cancelled from here? or let it run as suggested above
+			return status == "success"
 		})
 }
 

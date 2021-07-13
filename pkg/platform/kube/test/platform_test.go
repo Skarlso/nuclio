@@ -38,6 +38,7 @@ import (
 	"github.com/nuclio/nuclio/pkg/processor/trigger/cron"
 	testk8s "github.com/nuclio/nuclio/test/common/k8s"
 
+	"github.com/gobuffalo/flect"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/nuclio/errors"
@@ -50,6 +51,7 @@ import (
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 type DeployFunctionTestSuite struct {
@@ -205,24 +207,27 @@ AttributeError: module 'main' has no attribute 'expected_handler'
 		},
 	} {
 		suite.Run(testCase.Name, func() {
-			_, err := suite.DeployFunctionExpectError(testCase.CreateFunctionOptions, func(deployResult *platform.CreateFunctionResult) bool {
+			_, err := suite.DeployFunctionExpectError(testCase.CreateFunctionOptions,
+				func(deployResult *platform.CreateFunctionResult) bool {
 
-				// get the function
-				function := suite.GetFunction(&platform.GetFunctionsOptions{
-					Name:      testCase.CreateFunctionOptions.FunctionConfig.Meta.Name,
-					Namespace: testCase.CreateFunctionOptions.FunctionConfig.Meta.Namespace,
+					// get the function
+					function := suite.GetFunction(&platform.GetFunctionsOptions{
+						Name:      testCase.CreateFunctionOptions.FunctionConfig.Meta.Name,
+						Namespace: testCase.CreateFunctionOptions.FunctionConfig.Meta.Namespace,
+					})
+
+					// validate the brief error message in function status is at least 95% close to the expected brief error message
+					// keep it flexible for close enough messages in case small changes occur (e.g. line numbers on stack trace)
+					briefErrorMessageDiff := common.CompareTwoStrings(testCase.ExpectedBriefErrorsMessage, function.GetStatus().Message)
+					suite.Require().GreaterOrEqual(briefErrorMessageDiff, float32(0.95))
+
+					return true
 				})
-
-				// validate the brief error message in function status is at least 95% close to the expected brief error message
-				// keep it flexible for close enough messages in case small changes occur (e.g. line numbers on stack trace)
-				briefErrorMessageDiff := common.CompareTwoStrings(testCase.ExpectedBriefErrorsMessage, function.GetStatus().Message)
-				suite.Require().GreaterOrEqual(briefErrorMessageDiff, float32(0.95))
-
-				return true
-			})
 			suite.Require().Error(err)
 
-			err = suite.Platform.DeleteFunction(&platform.DeleteFunctionOptions{FunctionConfig: testCase.CreateFunctionOptions.FunctionConfig})
+			err = suite.Platform.DeleteFunction(&platform.DeleteFunctionOptions{
+				FunctionConfig: testCase.CreateFunctionOptions.FunctionConfig,
+			})
 			suite.Require().NoError(err)
 		})
 	}
@@ -382,6 +387,104 @@ func (suite *DeployFunctionTestSuite) TestSecurityContext() {
 			strings.TrimSpace(results.Output))
 		return true
 	})
+}
+
+func (suite *DeployFunctionTestSuite) TestAssigningFunctionPodToNodes() {
+
+	// TODO: currently is not working on minikube
+	suite.T().Skip("Run manually")
+	existingNodes := suite.GetNodes()
+	suite.Require().NotEmpty(existingNodes, "Must have at least one node available")
+
+	testNodeName := existingNodes[0].GetName()
+	testLabelKey := "test-nuclio.io"
+
+	labelPatch := fmt.Sprintf(`[{"op":"add","path":"/metadata/labels/%s","value":"%s"}]`, testLabelKey, "true")
+	_, err := suite.KubeClientSet.CoreV1().Nodes().Patch(testNodeName, types.JSONPatchType, []byte(labelPatch))
+	suite.Require().NoError(err, "Failed to patch node labels")
+
+	// undo changes
+	defer func() {
+		suite.Logger.DebugWith("Rolling back node labels change")
+		labelPatch = fmt.Sprintf(`[{"op":"remove","path":"/metadata/labels/%s"}]`, testLabelKey)
+		_, err := suite.KubeClientSet.CoreV1().Nodes().Patch(testNodeName, types.JSONPatchType, []byte(labelPatch))
+		suite.Require().NoError(err, "Failed to patch node labels")
+	}()
+
+	for _, testCase := range []struct {
+		name string
+
+		// function spec
+		nodeName        string
+		nodeSelector    map[string]string
+		nodeAffinity    *v1.Affinity
+		expectedFailure bool
+	}{
+		{
+			name:     "AssignByNodeName",
+			nodeName: testNodeName,
+		},
+		{
+			name:            "UnscheduledNoSuchNodeName",
+			nodeName:        "nuclio-do-not-should-not-exists",
+			expectedFailure: true,
+		},
+		{
+			name: "AssignByNodeSelector",
+			nodeSelector: map[string]string{
+				testLabelKey: "true",
+			},
+		},
+		{
+			name: "UnscheduledNoSuchLabel",
+			nodeSelector: map[string]string{
+				testLabelKey: "false",
+			},
+			expectedFailure: true,
+		},
+	} {
+		suite.Run(testCase.name, func() {
+			functionName := flect.Dasherize(testCase.name)
+			createFunctionOptions := suite.CompileCreateFunctionOptions(functionName)
+			createFunctionOptions.FunctionConfig.Spec.NodeName = testCase.nodeName
+			createFunctionOptions.FunctionConfig.Spec.Affinity = testCase.nodeAffinity
+			createFunctionOptions.FunctionConfig.Spec.NodeSelector = testCase.nodeSelector
+			if testCase.expectedFailure {
+
+				// dont wait for too long
+				createFunctionOptions.FunctionConfig.Spec.ReadinessTimeoutSeconds = 15
+				_, err := suite.DeployFunctionExpectError(createFunctionOptions,
+					func(deployResult *platform.CreateFunctionResult) bool {
+						return true
+					})
+				suite.Require().Error(err)
+
+				if testCase.nodeSelector != nil {
+					pods := suite.GetFunctionPods(functionName)
+					podEvents, err := suite.KubeClientSet.CoreV1().Events(suite.Namespace).List(metav1.ListOptions{
+						FieldSelector: fmt.Sprintf("involvedObject.name=%s", pods[0].GetName()),
+					})
+					suite.Require().NoError(err)
+					suite.Require().NotNil(podEvents)
+					suite.Require().Equal("FailedScheduling", podEvents.Items[0].Reason)
+				}
+			} else {
+				suite.DeployFunction(createFunctionOptions, func(deployResult *platform.CreateFunctionResult) bool {
+					pods := suite.GetFunctionPods(functionName)
+					if testCase.nodeName != "" {
+						suite.Require().Equal(testCase.nodeName, pods[0].Spec.NodeName)
+					}
+					if testCase.nodeSelector != nil {
+						suite.Require().Equal(testCase.nodeSelector, pods[0].Spec.NodeSelector)
+					}
+					if testCase.nodeAffinity != nil {
+						suite.Require().Equal(testCase.nodeAffinity, pods[0].Spec.Affinity)
+					}
+					return true
+				})
+			}
+		})
+	}
 }
 
 func (suite *DeployFunctionTestSuite) TestAugmentedConfig() {
@@ -616,6 +719,49 @@ func (suite *DeployFunctionTestSuite) TestCreateFunctionWithIngress() {
 
 			functionIngress := suite.GetFunctionIngress(functionName)
 			suite.Require().Equal(ingressHost, functionIngress.Spec.Rules[0].Host)
+			return true
+
+		}, func(deployResult *platform.CreateFunctionResult) bool {
+
+			// sanity check, redeploy does break on certain ingress / apigateway ingress validations
+			return true
+		})
+}
+
+func (suite *DeployFunctionTestSuite) TestCreateFunctionWithTemplatedIngress() {
+	functionName := "func-with-ingress"
+	createFunctionOptions := suite.CompileCreateFunctionOptions(functionName)
+	createFunctionOptions.FunctionConfig.Spec.Triggers = map[string]functionconfig.Trigger{
+		"customTrigger": {
+			Kind:       "http",
+			Name:       "customTrigger",
+			MaxWorkers: 3,
+			Attributes: map[string]interface{}{
+				"ingresses": map[string]interface{}{
+					"someKey": map[string]interface{}{
+						"paths":        []string{"/"},
+						"hostTemplate": "{{ .ResourceName }}.{{ .Namespace }}.nuclio.com",
+					},
+				},
+			},
+		},
+	}
+
+	suite.DeployFunctionAndRedeploy(createFunctionOptions,
+		func(deployResult *platform.CreateFunctionResult) bool {
+
+			// wait for function to become ready
+			// that ensure us all of its resources (ingresses) are created correctly
+			suite.WaitForFunctionState(&platform.GetFunctionsOptions{
+				Name:      functionName,
+				Namespace: suite.Namespace,
+			}, functionconfig.FunctionStateReady, time.Minute)
+
+			expectedIngressHost := fmt.Sprintf("%s.%s.nuclio.com",
+				functionName,
+				createFunctionOptions.FunctionConfig.Meta.Namespace)
+			functionIngress := suite.GetFunctionIngress(functionName)
+			suite.Require().Equal(expectedIngressHost, functionIngress.Spec.Rules[0].Host)
 			return true
 
 		}, func(deployResult *platform.CreateFunctionResult) bool {
@@ -871,8 +1017,10 @@ func (suite *DeployAPIGatewayTestSuite) TestDexAuthMode() {
 		createAPIGatewayOptions := suite.compileCreateAPIGatewayOptions(apiGatewayName, functionName)
 		createAPIGatewayOptions.APIGatewayConfig.Spec.AuthenticationMode = ingress.AuthenticationModeOauth2
 		err := suite.deployAPIGateway(createAPIGatewayOptions, func(ingress *extensionsv1beta1.Ingress) {
-			suite.Assert().NotContains(ingress.Annotations, "nginx.ingress.kubernetes.io/auth-signin")
-			suite.Assert().Contains(ingress.Annotations["nginx.ingress.kubernetes.io/auth-url"], configOauth2ProxyURL)
+			suite.Require().NotContains(ingress.Annotations, "nginx.ingress.kubernetes.io/auth-signin")
+			suite.Require().Contains(ingress.Annotations["nginx.ingress.kubernetes.io/auth-url"], configOauth2ProxyURL)
+			suite.Require().Contains(ingress.Annotations["nginx.ingress.kubernetes.io/configuration-snippet"],
+				fmt.Sprintf(`proxy_set_header X-Nuclio-Target "%s";`, functionName))
 		})
 		suite.Require().NoError(err)
 
@@ -1104,7 +1252,7 @@ func (suite *ProjectTestSuite) TestDelete() {
 		Meta: projectConfig.Meta,
 	})
 	suite.Require().NoError(err, "Failed to get projects")
-	suite.Require().Equal(len(projects), 0)
+	suite.Require().Equal(0, len(projects))
 }
 
 func (suite *ProjectTestSuite) TestDeleteCascading() {

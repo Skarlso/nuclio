@@ -17,13 +17,20 @@ limitations under the License.
 package resource
 
 import (
+	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/dashboard"
 	"github.com/nuclio/nuclio/pkg/platform"
 	"github.com/nuclio/nuclio/pkg/restful"
+
+	"github.com/nuclio/errors"
+	"github.com/nuclio/nuclio-sdk-go"
 )
 
 type invocationResource struct {
@@ -51,6 +58,7 @@ func (tr *invocationResource) OnAfterInitialize() error {
 func (tr *invocationResource) handleRequest(responseWriter http.ResponseWriter, request *http.Request) {
 	path := request.Header.Get("x-nuclio-path")
 	functionName := request.Header.Get("x-nuclio-function-name")
+	invokeURL := request.Header.Get("x-nuclio-invoke-url")
 	invokeVia := tr.getInvokeVia(request.Header.Get("x-nuclio-invoke-via"))
 
 	// get namespace from request or use the provided default
@@ -61,15 +69,21 @@ func (tr *invocationResource) handleRequest(responseWriter http.ResponseWriter, 
 
 	if functionName == "" || functionNamespace == "" {
 		tr.writeErrorHeader(responseWriter, http.StatusBadRequest)
-		responseWriter.Write([]byte(`{"error": "Function name must be provided"}`)) // nolint: errcheck
+		tr.writeErrorMessage(responseWriter, "Function name must be provided")
 		return
 	}
 
 	requestBody, err := ioutil.ReadAll(request.Body)
 	if err != nil {
 		tr.writeErrorHeader(responseWriter, http.StatusInternalServerError)
-		responseWriter.Write([]byte(`{"error": "Failed to read request body"}`)) // nolint: errcheck
+		tr.writeErrorMessage(responseWriter, "Failed to read request body")
 		return
+	}
+
+	invokeTimeout, err := tr.resolveInvokeTimeout(request.Header.Get("x-nuclio-invoke-timeout"))
+	if err != nil {
+		tr.writeErrorHeader(responseWriter, http.StatusBadRequest)
+		tr.writeErrorMessage(responseWriter, errors.RootCause(err).Error())
 	}
 
 	// resolve the function host
@@ -81,13 +95,14 @@ func (tr *invocationResource) handleRequest(responseWriter http.ResponseWriter, 
 		Headers:   request.Header,
 		Body:      requestBody,
 		Via:       invokeVia,
+		URL:       invokeURL,
+		Timeout:   invokeTimeout,
 	})
 
 	if err != nil {
 		tr.Logger.WarnWith("Failed to invoke function", "err", err)
-
-		tr.writeErrorHeader(responseWriter, http.StatusInternalServerError)
-		responseWriter.Write([]byte(`{"error": "Failed to invoke function"}`)) // nolint: errcheck
+		tr.writeErrorHeader(responseWriter, common.ResolveErrorStatusCodeOrDefault(err, http.StatusInternalServerError))
+		tr.writeErrorMessage(responseWriter, fmt.Sprintf("Failed to invoke function: %v", errors.RootCause(err)))
 		return
 	}
 
@@ -122,6 +137,22 @@ func (tr *invocationResource) getInvokeVia(invokeViaName string) platform.Invoke
 func (tr *invocationResource) writeErrorHeader(responseWriter http.ResponseWriter, statusCode int) {
 	responseWriter.Header().Set("Content-Type", "application/json")
 	responseWriter.WriteHeader(statusCode)
+}
+
+func (tr *invocationResource) writeErrorMessage(responseWriter io.Writer, message string) {
+	formattedMessage := fmt.Sprintf(`{"error": "%s"}`, message)
+	responseWriter.Write([]byte(formattedMessage)) // nolint: errcheck
+}
+
+func (tr *invocationResource) resolveInvokeTimeout(invokeTimeout string) (time.Duration, error) {
+	if invokeTimeout == "" {
+		return platform.FunctionInvocationDefaultTimeout, nil
+	}
+	parsedDuration, err := time.ParseDuration(invokeTimeout)
+	if err != nil {
+		return 0, nuclio.NewErrBadRequest("Invalid invoke timeout")
+	}
+	return parsedDuration, nil
 }
 
 // register the resource

@@ -17,6 +17,8 @@ limitations under the License.
 package dockerclient
 
 import (
+	"context"
+	"io"
 	"time"
 )
 
@@ -88,4 +90,10 @@ type Client interface {
 
 	// GetVersion returns docker client and engine versions
 	GetVersion(quiet bool) (string, error)
+
+	// GetContainerIPAddresses return list of container ip addresses
+	GetContainerIPAddresses(containerID string) ([]string, error)
+
+	// GetContainerLogStream return container log stream
+	GetContainerLogStream(ctx context.Context, containerID string, logOptions *ContainerLogsOptions) (io.ReadCloser, error)
 }

@@ -23,6 +23,7 @@ import (
 
 	"github.com/nuclio/nuclio/pkg/containerimagebuilderpusher"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/runtimeconfig"
 
 	"github.com/nuclio/errors"
@@ -38,14 +39,21 @@ type Config struct {
 	AutoScale                AutoScale                    `json:"autoScale,omitempty"`
 	CronTriggerCreationMode  CronTriggerCreationMode      `json:"cronTriggerCreationMode,omitempty"`
 	FunctionAugmentedConfigs []LabelSelectorAndConfig     `json:"functionAugmentedConfigs,omitempty"`
+	FunctionReadinessTimeout *string                      `json:"functionReadinessTimeout,omitempty"`
 	IngressConfig            IngressConfig                `json:"ingressConfig,omitempty"`
 	Kube                     PlatformKubeConfig           `json:"kube,omitempty"`
 	Local                    PlatformLocalConfig          `json:"local,omitempty"`
 	ImageRegistryOverrides   ImageRegistryOverridesConfig `json:"imageRegistryOverrides,omitempty"`
 	Runtime                  *runtimeconfig.Config        `json:"runtime,omitempty"`
 	ProjectsLeader           *ProjectsLeader              `json:"projectsLeader,omitempty"`
+	ManagedNamespaces        []string                     `json:"managedNamespaces,omitempty"`
+	IguazioSessionCookie     string                       `json:"iguazioSessionCookie,omitempty"`
+	Opa                      opa.Config                   `json:"opa,omitempty"`
 
 	ContainerBuilderConfiguration *containerimagebuilderpusher.ContainerBuilderConfiguration `json:"containerBuilderConfiguration,omitempty"`
+
+	// stores the encoded FunctionReadinessTimeout as time.Duration
+	functionReadinessTimeout *time.Duration
 }
 
 func NewPlatformConfig(configurationPath string) (*Config, error) {
@@ -68,6 +76,9 @@ func NewPlatformConfig(configurationPath string) (*Config, error) {
 		config.Kind = "local"
 	}
 
+	// enrich opa configuration
+	config.enrichOpaConfig()
+
 	// enrich local platform configuration
 	config.enrichLocalPlatform()
 
@@ -80,6 +91,17 @@ func NewPlatformConfig(configurationPath string) (*Config, error) {
 	if config.Kube.DefaultServiceType == "" {
 		config.Kube.DefaultServiceType = DefaultServiceType
 	}
+
+	if config.FunctionReadinessTimeout == nil {
+		encodedReadinessTimeoutDuration := (DefaultFunctionReadinessTimeoutSeconds * time.Second).String()
+		config.FunctionReadinessTimeout = &encodedReadinessTimeoutDuration
+	}
+
+	functionReadinessTimeout, err := time.ParseDuration(*config.FunctionReadinessTimeout)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to parse function readiness timeout")
+	}
+	config.functionReadinessTimeout = &functionReadinessTimeout
 
 	return config, nil
 }
@@ -115,6 +137,17 @@ func (config *Config) GetFunctionLoggerSinks(functionConfig *functionconfig.Conf
 	}
 
 	return config.getLoggerSinksWithLevel(loggerSinkBindings)
+}
+
+func (config *Config) GetDefaultFunctionReadinessTimeout() time.Duration {
+
+	// provided by the platform-config
+	if config.functionReadinessTimeout != nil {
+		return *config.functionReadinessTimeout
+	}
+
+	// no configuration were explicitly given, return default
+	return DefaultFunctionReadinessTimeoutSeconds * time.Second
 }
 
 func (config *Config) GetSystemMetricSinks() (map[string]MetricSink, error) {
@@ -177,5 +210,23 @@ func (config *Config) enrichLocalPlatform() {
 
 	if config.Local.FunctionContainersHealthinessTimeout == 0 {
 		config.Local.FunctionContainersHealthinessTimeout = time.Second * 5
+	}
+}
+
+func (config *Config) enrichOpaConfig() {
+	if config.Opa.Address == "" {
+		config.Opa.Address = "127.0.0.1:8181"
+	}
+
+	if config.Opa.ClientKind == "" {
+		config.Opa.ClientKind = opa.DefaultClientKind
+	}
+
+	if config.Opa.RequestTimeout == 0 {
+		config.Opa.RequestTimeout = opa.DefaultRequestTimeOut
+	}
+
+	if config.Opa.PermissionQueryPath == "" {
+		config.Opa.PermissionQueryPath = opa.DefaultPermissionQueryPath
 	}
 }

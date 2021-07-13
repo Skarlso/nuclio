@@ -71,14 +71,22 @@ func (d *Deployer) CreateOrUpdateFunction(functionInstance *nuclioio.NuclioFunct
 		functionInstance = &nuclioio.NuclioFunction{}
 		functionInstance.Status.State = functionconfig.FunctionStateWaitingForResourceConfiguration
 	} else {
+		functionStatus.InternalInvocationURLs = functionInstance.Status.InternalInvocationURLs
+		functionStatus.ExternalInvocationURLs = functionInstance.Status.ExternalInvocationURLs
 		functionStatus.HTTPPort = functionInstance.Status.HTTPPort
 	}
 
 	// convert config, status -> function
-	d.populateFunction(&createFunctionOptions.FunctionConfig, functionStatus, functionInstance, functionExists)
+	if err := d.populateFunction(&createFunctionOptions.FunctionConfig,
+		functionStatus,
+		functionInstance,
+		functionExists); err != nil {
+		return nil, errors.Wrap(err, "Failed to populate function")
+	}
 
 	createFunctionOptions.Logger.DebugWith("Populated function with configuration and status",
-		"function", functionInstance)
+		"function", functionInstance,
+		"functionExists", functionExists)
 
 	// get clientset
 	nuclioClientSet, err := d.consumer.getNuclioClientSet(createFunctionOptions.AuthConfig)
@@ -136,14 +144,15 @@ func (d *Deployer) Deploy(functionInstance *nuclioio.NuclioFunction,
 	}
 
 	return &platform.CreateFunctionResult{
-		Port: updatedFunctionInstance.Status.HTTPPort,
+		Port:           updatedFunctionInstance.Status.HTTPPort,
+		FunctionStatus: updatedFunctionInstance.Status,
 	}, updatedFunctionInstance, "", nil
 }
 
 func (d *Deployer) populateFunction(functionConfig *functionconfig.Config,
 	functionStatus *functionconfig.Status,
 	functionInstance *nuclioio.NuclioFunction,
-	functionExisted bool) {
+	functionExisted bool) error {
 
 	functionInstance.Spec = functionConfig.Spec
 
@@ -181,6 +190,16 @@ func (d *Deployer) populateFunction(functionConfig *functionconfig.Config,
 
 	// update status
 	functionInstance.Status = *functionStatus
+
+	externalIPAddresses, err := d.platform.GetExternalIPAddresses()
+	if err != nil {
+		return errors.Wrap(err, "Failed to get external ip address")
+	}
+
+	// -1 because port was not assigned yet, it is just a placeholder
+	functionInstance.Status.ExternalInvocationURLs = []string{fmt.Sprintf("%s:-1", externalIPAddresses[0])}
+	return nil
+
 }
 
 func (d *Deployer) getFunctionPodLogsAndEvents(namespace string, name string) (string, string) {
@@ -191,7 +210,7 @@ func (d *Deployer) getFunctionPodLogsAndEvents(namespace string, name string) (s
 	functionPods, listPodErr := d.consumer.KubeClientSet.CoreV1().
 		Pods(namespace).
 		List(metav1.ListOptions{
-			LabelSelector: compileListFunctionPodsLabelSelector(name),
+			LabelSelector: common.CompileListFunctionPodsLabelSelector(name),
 		})
 
 	if listPodErr != nil {
@@ -276,7 +295,7 @@ func isFunctionDeploymentFailed(consumer *Consumer,
 	pods, err := consumer.KubeClientSet.CoreV1().
 		Pods(namespace).
 		List(metav1.ListOptions{
-			LabelSelector: compileListFunctionPodsLabelSelector(name),
+			LabelSelector: common.CompileListFunctionPodsLabelSelector(name),
 		})
 	if err != nil {
 		return false, errors.Wrap(err, "Failed to Get pods")
@@ -317,10 +336,6 @@ func isFunctionDeploymentFailed(consumer *Consumer,
 	}
 
 	return false, nil
-}
-
-func compileListFunctionPodsLabelSelector(functionName string) string {
-	return fmt.Sprintf("nuclio.io/function-name=%s,nuclio.io/function-cron-job-pod!=true", functionName)
 }
 
 func waitForFunctionReadiness(loggerInstance logger.Logger,

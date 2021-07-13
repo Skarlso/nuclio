@@ -3,7 +3,7 @@ module github.com/nuclio/nuclio
 go 1.14
 
 require (
-	cloud.google.com/go/pubsub v1.2.0
+	cloud.google.com/go/pubsub v1.10.2
 	code.cloudfoundry.org/clock v1.0.0 // indirect
 	github.com/Azure/azure-sdk-for-go v43.3.0+incompatible // indirect
 	github.com/Azure/go-autorest/autorest v0.11.0 // indirect
@@ -19,14 +19,15 @@ require (
 	github.com/eclipse/paho.mqtt.golang v1.2.0
 	github.com/fatih/structs v1.1.0
 	github.com/ghodss/yaml v1.0.0
-	github.com/go-chi/chi v4.0.2+incompatible
+	github.com/go-chi/chi/v5 v5.0.2
 	github.com/go-chi/cors v1.0.0
+	github.com/go-git/go-git/v5 v5.4.2
 	github.com/gobuffalo/flect v0.2.2
-	github.com/google/go-cmp v0.5.4
+	github.com/google/go-cmp v0.5.5
 	github.com/hashicorp/go-uuid v1.0.1
 	github.com/heptiolabs/healthcheck v0.0.0-20180807145615-6ff867650f40
 	github.com/icza/dyno v0.0.0-20180601094105-0c96289f9585
-	github.com/imdario/mergo v0.3.7
+	github.com/imdario/mergo v0.3.12
 	github.com/jarcoal/httpmock v1.0.4
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/mgutz/ansi v0.0.0-20200706080929-d51e80ef957d
@@ -41,7 +42,7 @@ require (
 	github.com/nuclio/logger v0.0.1
 	github.com/nuclio/logger-appinsights v0.0.1
 	github.com/nuclio/nuclio-sdk-go v0.2.0
-	github.com/nuclio/zap v0.0.4
+	github.com/nuclio/zap v0.0.6
 	github.com/olekukonko/tablewriter v0.0.1
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/prometheus/client_golang v1.1.0
@@ -52,20 +53,20 @@ require (
 	github.com/sendgridlabs/go-kinesis v0.0.0-20190306160747-8de9069567f6
 	github.com/spf13/cobra v0.0.5
 	github.com/streadway/amqp v0.0.0-20190815230801-eade30b20f1d
-	github.com/stretchr/testify v1.6.1
+	github.com/stretchr/testify v1.7.0
 	github.com/tedsuo/ifrit v0.0.0-20191009134036-9a97d0632f00 // indirect
 	github.com/tsenart/vegeta/v12 v12.8.4
-	github.com/v3io/scaler v0.4.0
-	github.com/v3io/scaler-types v1.7.0
-	github.com/v3io/v3io-go v0.2.3
+	github.com/v3io/scaler v0.5.0
+	github.com/v3io/v3io-go v0.2.8
 	github.com/v3io/v3io-go-http v0.0.1
 	github.com/v3io/version-go v0.0.2
 	github.com/valyala/fasthttp v1.21.0
 	github.com/vmihailenco/msgpack/v4 v4.3.12
-	golang.org/x/sync v0.0.0-20200317015054-43a5402ce75a
+	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
+	google.golang.org/api v0.43.0
+	google.golang.org/grpc v1.36.1
 	gopkg.in/DATA-DOG/go-sqlmock.v1 v1.3.0 // indirect
-	gopkg.in/src-d/go-git.v4 v4.13.1
-	gopkg.in/yaml.v2 v2.2.8
+	gopkg.in/yaml.v2 v2.3.0
 	k8s.io/api v0.17.17
 	k8s.io/apimachinery v0.17.17
 	k8s.io/client-go v0.17.17

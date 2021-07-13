@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/v3io/scaler-types"
+	"github.com/v3io/scaler/pkg/scalertypes"
 	"k8s.io/api/core/v1"
 )
 
@@ -94,23 +94,21 @@ func GetTriggersByKind(triggers map[string]Trigger, kind string) map[string]Trig
 	return matchingTrigger
 }
 
-// GetIngressesFromTriggers returns all ingresses from a map of triggers
-func GetIngressesFromTriggers(triggers map[string]Trigger) map[string]Ingress {
-	ingresses := map[string]Ingress{}
+func GetFunctionIngresses(config *Config) map[string]Ingress {
 
-	for _, trigger := range GetTriggersByKind(triggers, "http") {
+	ingresses := map[string]Ingress{}
+	for _, httpTrigger := range GetTriggersByKind(config.Spec.Triggers, "http") {
 
 		// if there are attributes
-		if encodedIngresses, found := trigger.Attributes["ingresses"]; found {
+		if encodedIngresses, found := httpTrigger.Attributes["ingresses"]; found {
 
 			// iterate over the encoded ingresses map and created ingress structures
 			encodedIngresses := encodedIngresses.(map[string]interface{})
 			for encodedIngressName, encodedIngress := range encodedIngresses {
 				encodedIngressMap := encodedIngress.(map[string]interface{})
 
-				ingress := Ingress{}
+				var ingress Ingress
 
-				// try to convert host
 				if host, ok := encodedIngressMap["host"].(string); ok {
 					ingress.Host = host
 				}
@@ -126,7 +124,7 @@ func GetIngressesFromTriggers(triggers map[string]Trigger) map[string]Ingress {
 				}
 
 				// try to convert secretName and create a matching ingressTLS
-				ingressTLS := IngressTLS{}
+				var ingressTLS IngressTLS
 				if secretName, ok := encodedIngressMap["secretName"].(string); ok {
 					hostsList := []string{ingress.Host}
 
@@ -139,7 +137,6 @@ func GetIngressesFromTriggers(triggers map[string]Trigger) map[string]Ingress {
 			}
 		}
 	}
-
 	return ingresses
 }
 
@@ -258,6 +255,12 @@ type Spec struct {
 	SecurityContext         *v1.PodSecurityContext  `json:"securityContext,omitempty"`
 	ServiceAccount          string                  `json:"serviceAccount,omitempty"`
 	ScaleToZero             *ScaleToZeroSpec        `json:"scaleToZero,omitempty"`
+
+	// Run function on a particular set of node(s)
+	// https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+	Affinity     *v1.Affinity      `json:"affinity,omitempty"`
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	NodeName     string            `json:"nodeName,omitempty"`
 
 	// Currently relevant only for k8s platform
 	// if true - wait the whole ReadinessTimeoutSeconds before marking this function as unhealthy
@@ -512,14 +515,28 @@ type Status struct {
 	State       FunctionState            `json:"state,omitempty"`
 	Message     string                   `json:"message,omitempty"`
 	Logs        []map[string]interface{} `json:"logs,omitempty"`
-	HTTPPort    int                      `json:"httpPort,omitempty"`
 	ScaleToZero *ScaleToZeroStatus       `json:"scaleToZero,omitempty"`
 	APIGateways []string                 `json:"apiGateways,omitempty"`
+	HTTPPort    int                      `json:"httpPort,omitempty"`
+
+	// list of internal urls
+	// e.g.:
+	//		Kubernetes 	-	[ my-namespace.my-function.svc.cluster.local:8080 ]
+	//		Docker 		-	[ function-container-name:8080 ]
+	InternalInvocationURLs []string `json:"internalInvocationUrls,omitempty"`
+
+	// list of external urls, containing ingresses and external-ip:function-port
+	// e.g.: [ my-function.some-domain.com/pathA, other-ingress.some-domain.co, 1.2.3.4:3000 ]
+	ExternalInvocationURLs []string `json:"externalInvocationUrls,omitempty"`
+}
+
+func (s *Status) InvocationURLs() []string {
+	return append(s.InternalInvocationURLs, s.ExternalInvocationURLs...)
 }
 
 type ScaleToZeroStatus struct {
-	LastScaleEvent     scaler_types.ScaleEvent `json:"lastScaleEvent,omitempty"`
-	LastScaleEventTime *time.Time              `json:"lastScaleEventTime,omitempty"`
+	LastScaleEvent     scalertypes.ScaleEvent `json:"lastScaleEvent,omitempty"`
+	LastScaleEventTime *time.Time             `json:"lastScaleEventTime,omitempty"`
 }
 
 // DeepCopyInto copies to appease k8s

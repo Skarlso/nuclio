@@ -19,8 +19,10 @@ limitations under the License.
 package functionres
 
 import (
+	"context"
 	"testing"
 
+	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
 	"github.com/nuclio/nuclio/pkg/platform/abstract"
 	nuclioio "github.com/nuclio/nuclio/pkg/platform/kube/apis/nuclio.io/v1beta1"
@@ -70,15 +72,70 @@ func (suite *lazyTestSuite) SetupTest() {
 	})
 }
 
+func (suite *lazyTestSuite) TestNodeConstrains() {
+	functionInstance := &nuclioio.NuclioFunction{}
+	functionInstance.Name = "func-name"
+	functionInstance.Spec.NodeName = "some-node-name"
+	functionInstance.Spec.NodeSelector = map[string]string{
+		"some-key": "some-value",
+	}
+	functionInstance.Spec.Affinity = &v1.Affinity{
+		NodeAffinity: &v1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+				NodeSelectorTerms: []v1.NodeSelectorTerm{
+					{
+						MatchExpressions: []v1.NodeSelectorRequirement{
+							{
+								Key: "req-key",
+								Values: []string{
+									"a",
+									"b",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	resources, err := suite.client.CreateOrUpdate(context.TODO(), functionInstance, "")
+	suite.Require().NoError(err)
+	suite.Require().NotEmpty(resources)
+	deployment, err := resources.Deployment()
+	suite.Require().NoError(err)
+
+	// ensure fields were passed
+	deployment.Spec.Template.Spec.NodeName = functionInstance.Spec.NodeName
+	deployment.Spec.Template.Spec.NodeSelector = functionInstance.Spec.NodeSelector
+	deployment.Spec.Template.Spec.Affinity = functionInstance.Spec.Affinity
+}
+
 func (suite *lazyTestSuite) TestNoChanges() {
 	one := 1
+	defaultHTTPTrigger := functionconfig.GetDefaultHTTPTrigger()
+	defaultHTTPTrigger.Attributes = map[string]interface{}{
+		"ingresses": map[string]interface{}{
+			"0": map[string]interface{}{
+				"hostTemplate": "@nuclio.fromDefault",
+				"paths":        []string{"/"},
+			},
+		},
+	}
 	function := nuclioio.NuclioFunction{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "my-function",
 			Namespace: "test-namespace",
+			Labels: map[string]string{
+
+				// we want the created ingress host to be exceed the length limitation
+				"nuclio.io/project-name": common.GenerateRandomString(60, common.SmallLettersAndNumbers),
+			},
 		},
 		Spec: functionconfig.Spec{
 			Replicas: &one,
+			Triggers: map[string]functionconfig.Trigger{
+				defaultHTTPTrigger.Name: defaultHTTPTrigger,
+			},
 		},
 	}
 	functionLabels := suite.client.getFunctionLabels(&function)
@@ -88,6 +145,21 @@ func (suite *lazyTestSuite) TestNoChanges() {
 	prevLevel := suite.client.logger.(*nucliozap.NuclioZap).GetLevel()
 	suite.client.logger.(*nucliozap.NuclioZap).SetLevel(nucliozap.InfoLevel)
 	defer suite.client.logger.(*nucliozap.NuclioZap).SetLevel(prevLevel)
+
+	suite.client.SetPlatformConfigurationProvider(&mockedPlatformConfigurationProvider{
+		platformConfiguration: &platformconfig.Config{
+			Kube: platformconfig.PlatformKubeConfig{
+				DefaultHTTPIngressHostTemplate: "{{ .ResourceName }}-{{ .ProjectName }}.test-nuclio.com",
+			},
+		},
+	})
+
+	suite.client.nginxIngressUpdateGracePeriod = 0
+
+	// "create the ingress
+	ingressInstance, err := suite.client.createOrUpdateIngress(functionLabels, &function)
+	suite.Require().NoError(err)
+	suite.Require().NotNil(ingressInstance)
 
 	// "create" the deployment
 	deploymentInstance, err := suite.client.createOrUpdateDeployment(functionLabels,
@@ -99,12 +171,20 @@ func (suite *lazyTestSuite) TestNoChanges() {
 	// make sure no changes were applied for 1000 times of re-apply deployment.
 	for i := 0; i < 1000; i++ {
 
+		// "update" the ingress
+		updatedIngressInstance, err := suite.client.createOrUpdateIngress(functionLabels, &function)
+		suite.Require().NoError(err)
+		suite.Require().NotNil(updatedIngressInstance)
+
+		// ensure no changes
+		suite.Require().Empty(cmp.Diff(ingressInstance, updatedIngressInstance))
+
 		// "update" the deployment
 		updatedDeploymentInstance, err := suite.client.createOrUpdateDeployment(functionLabels,
 			"image-pull-secret-str",
 			&function)
 		suite.Require().NoError(err)
-		suite.Require().NotNil(deploymentInstance)
+		suite.Require().NotNil(updatedDeploymentInstance)
 
 		// ensure no changes
 		suite.Require().Empty(cmp.Diff(deploymentInstance, updatedDeploymentInstance))
@@ -160,6 +240,37 @@ func (suite *lazyTestSuite) TestTriggerDefinedNoIngresses() {
 	suite.Require().NoError(err)
 	suite.Require().NoError(err)
 	suite.Require().Len(ingressSpec.Rules, 0)
+}
+
+func (suite *lazyTestSuite) TestScaleToZeroSpecificAnnotations() {
+	suite.client.SetPlatformConfigurationProvider(&mockedPlatformConfigurationProvider{
+		platformConfiguration: &platformconfig.Config{
+			ScaleToZero: platformconfig.ScaleToZero{
+				HTTPTriggerIngressAnnotations: map[string]string{
+					"something": "added",
+				},
+			},
+		},
+	})
+
+	zero := 0
+	one := 1
+	ingressMeta := metav1.ObjectMeta{}
+	functionInstance := &nuclioio.NuclioFunction{}
+	functionInstance.Spec.MinReplicas = &zero
+	functionInstance.Spec.MaxReplicas = &one
+	functionInstance.Name = "func-name"
+	functionInstance.Spec.Triggers = map[string]functionconfig.Trigger{
+		"http": functionconfig.GetDefaultHTTPTrigger(),
+	}
+
+	functionLabels := suite.client.getFunctionLabels(functionInstance)
+	err := suite.client.populateIngressConfig(functionLabels,
+		functionInstance,
+		&ingressMeta,
+		&extv1beta1.IngressSpec{})
+	suite.Require().NoError(err)
+	suite.Require().Equal("added", ingressMeta.Annotations["something"])
 }
 
 func (suite *lazyTestSuite) TestTriggerDefinedMultipleIngresses() {

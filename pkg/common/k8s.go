@@ -1,6 +1,7 @@
 package common
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -44,6 +45,10 @@ func ResolveDefaultNamespace(defaultNamespace string) string {
 	return defaultNamespace
 }
 
+func CompileListFunctionPodsLabelSelector(functionName string) string {
+	return fmt.Sprintf("nuclio.io/function-name=%s,nuclio.io/function-cron-job-pod!=true", functionName)
+}
+
 func getKubeconfigFromHomeDir() string {
 	homeDir, err := homedir.Dir()
 	if err != nil {
@@ -53,8 +58,7 @@ func getKubeconfigFromHomeDir() string {
 	homeKubeConfigPath := filepath.Join(homeDir, ".kube", "config")
 
 	// if the file exists @ home, use it
-	_, err = os.Stat(homeKubeConfigPath)
-	if err == nil {
+	if _, err := os.Stat(homeKubeConfigPath); err == nil {
 		return homeKubeConfigPath
 	}
 

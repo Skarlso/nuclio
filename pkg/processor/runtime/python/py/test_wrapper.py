@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import asyncio
 import functools
 import http.client
 import json
@@ -41,6 +41,9 @@ class TestSubmitEvents(unittest.TestCase):
         cls._decode_event_strings = False
 
     def setUp(self):
+        self._loop = asyncio.get_event_loop()
+        self._loop.set_debug(True)
+
         self._temp_path = tempfile.mkdtemp(prefix='nuclio-test-py-wrapper')
 
         # write handler to temp path
@@ -64,10 +67,12 @@ class TestSubmitEvents(unittest.TestCase):
 
         # create a wrapper
         self._wrapper = wrapper.Wrapper(self._logger,
+                                        self._loop,
                                         self._default_test_handler,
                                         self._socket_path,
                                         self._platform_kind,
                                         decode_event_strings=self._decode_event_strings)
+        self._loop.run_until_complete(self._wrapper.initialize())
 
     def tearDown(self):
         sys.path.remove(self._temp_path)
@@ -75,6 +80,44 @@ class TestSubmitEvents(unittest.TestCase):
         self._unix_stream_server.server_close()
         self._unix_stream_server.shutdown()
         self._unix_stream_server_thread.join()
+
+    def test_async_handler(self):
+        """Test function decorated with async and running an event loop"""
+
+        recorded_events = []
+
+        async def event_recorder(context, event):
+            async def append_event(_event):
+                context.logger.debug_with('sleeping', event=repr(_event.id))
+                await asyncio.sleep(0)
+                context.logger.debug_with('appending event', event=repr(_event.id))
+                recorded_events.append(_event)
+
+            await asyncio.sleep(0)
+
+            # using `ensure_future` to BC with python:3.6 (on >= 3.7, you will see "create_task")
+            # https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+            asyncio.ensure_future(append_event(event), loop=self._loop)
+            return 'ok'
+
+        num_of_events = 10
+        events = (
+            nuclio_sdk.Event(_id=i, body='e{}'.format(i))
+            for i in range(num_of_events)
+        )
+        self._send_events(events)
+        self._wrapper._is_entrypoint_coroutine = True
+        self._wrapper._entrypoint = event_recorder
+        self._wrapper._processor_sock.setblocking(False)
+        self._loop.run_until_complete(self._wrapper.serve_requests(num_of_events))
+        self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        self.assertEqual(num_of_events, len(recorded_events), 'wrong number of events')
+
+        # we expect the event to be ordered since though the function is "asynchronous", it is blocked
+        # by the processor until it gets response.
+        for recorded_event_index, recorded_event in enumerate(sorted(recorded_events, key=operator.attrgetter('id'))):
+            self.assertEqual(recorded_event_index, recorded_event.id)
+            self.assertEqual('e{}'.format(recorded_event_index), self._ensure_str(recorded_event.body))
 
     def test_non_utf8_headers(self):
         """
@@ -99,7 +142,7 @@ class TestSubmitEvents(unittest.TestCase):
         t = threading.Thread(target=self._send_events, args=(events,))
         t.start()
 
-        self._wrapper.serve_requests(num_requests=len(events))
+        asyncio.get_event_loop().run_until_complete(self._wrapper.serve_requests(num_requests=len(events)))
         t.join()
 
         # processor start
@@ -137,7 +180,7 @@ class TestSubmitEvents(unittest.TestCase):
         self._send_event(nuclio_sdk.Event(_id='1'))
 
         self._wrapper._entrypoint = raise_exception
-        self._wrapper.serve_requests(num_requests=1)
+        asyncio.get_event_loop().run_until_complete(self._wrapper.serve_requests(num_requests=1))
 
         # processor start, function log line, response body
         self._wait_until_received_messages(3)
@@ -160,7 +203,7 @@ class TestSubmitEvents(unittest.TestCase):
         self._wrapper._entrypoint = unittest.mock.MagicMock()
         self._wrapper._entrypoint.assert_not_called()
         with self.assertRaises(SystemExit):
-            self._wrapper.serve_requests(num_requests=1)
+            asyncio.get_event_loop().run_until_complete(self._wrapper.serve_requests(num_requests=1))
         t.join()
 
     def test_single_event(self):
@@ -171,7 +214,7 @@ class TestSubmitEvents(unittest.TestCase):
         t = threading.Thread(target=self._send_event, args=(nuclio_sdk.Event(_id=1, body=reverse_text),))
         t.start()
 
-        self._wrapper.serve_requests(num_requests=1)
+        asyncio.get_event_loop().run_until_complete(self._wrapper.serve_requests(num_requests=1))
         t.join()
 
         # processor start, function log line, response body, duration messages
@@ -202,7 +245,7 @@ class TestSubmitEvents(unittest.TestCase):
         t.start()
 
         self._wrapper._entrypoint = functools.partial(record_event, recorded_event_ids)
-        self._wrapper.serve_requests(num_requests=expected_events_length)
+        asyncio.get_event_loop().run_until_complete(self._wrapper.serve_requests(num_requests=expected_events_length))
         t.join()
 
         # record incoming events
@@ -223,7 +266,7 @@ class TestSubmitEvents(unittest.TestCase):
         )
         self._send_events(events)
         self._wrapper._entrypoint = event_recorder
-        self._wrapper.serve_requests(num_of_events)
+        asyncio.get_event_loop().run_until_complete(self._wrapper.serve_requests(num_of_events))
         self.assertEqual(num_of_events, len(recorded_events), 'wrong number of events')
 
         for recorded_event_index, recorded_event in enumerate(sorted(recorded_events, key=operator.attrgetter('id'))):

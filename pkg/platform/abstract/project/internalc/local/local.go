@@ -1,4 +1,4 @@
-package project
+package local
 
 import (
 	"github.com/nuclio/nuclio/pkg/platform"
@@ -17,7 +17,7 @@ type Client struct {
 
 func NewClient(parentLogger logger.Logger, platform platform.Platform, localStore *client.Store) (abstractproject.Client, error) {
 	newClient := Client{
-		Logger:     parentLogger.GetChild("projects-client"),
+		Logger:     parentLogger.GetChild("projects-local"),
 		localStore: localStore,
 		platform:   platform,
 	}
@@ -26,7 +26,11 @@ func NewClient(parentLogger logger.Logger, platform platform.Platform, localStor
 }
 
 func (c *Client) Initialize() error {
-	return c.platform.EnsureDefaultProjectExistence()
+	return nil
+}
+
+func (c *Client) Get(getProjectsOptions *platform.GetProjectsOptions) ([]platform.Project, error) {
+	return c.localStore.GetProjects(&getProjectsOptions.Meta)
 }
 
 func (c *Client) Create(createProjectOptions *platform.CreateProjectOptions) (platform.Project, error) {
@@ -54,8 +58,4 @@ func (c *Client) Delete(deleteProjectOptions *platform.DeleteProjectOptions) err
 	}
 
 	return nil
-}
-
-func (c *Client) Get(getProjectsOptions *platform.GetProjectsOptions) ([]platform.Project, error) {
-	return c.localStore.GetProjects(&getProjectsOptions.Meta)
 }

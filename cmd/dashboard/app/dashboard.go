@@ -119,7 +119,7 @@ func Run(listenAddress string,
 	templatesGitUsername string,
 	templatesGitPassword string,
 	templatesGithubAccessToken string,
-	defaultHTTPIngressHostTemplate string,
+	templatesGitCaCertContents string,
 	imageNamePrefixTemplate string,
 	platformAuthorizationMode string,
 	dependantImageRegistryURL string,
@@ -182,7 +182,7 @@ func Run(listenAddress string,
 		templatesGitUsername:             templatesGitUsername,
 		templatesGitPassword:             templatesGitPassword,
 		templatesGithubAccessToken:       templatesGithubAccessToken,
-		defaultHTTPIngressHostTemplate:   defaultHTTPIngressHostTemplate,
+		templatesGitCaCertContents:       templatesGitCaCertContents,
 		imageNamePrefixTemplate:          imageNamePrefixTemplate,
 		platformAuthorizationMode:        platformAuthorizationMode,
 		dependantImageRegistryURL:        dependantImageRegistryURL,
@@ -253,7 +253,8 @@ func newDashboardServer(createDashboardServerOptions *CreateDashboardServerOptio
 
 		functionGitTemplateFetcher, err = functiontemplates.NewGitFunctionTemplateFetcher(rootLogger,
 			templatesGitRepository,
-			createDashboardServerOptions.templatesGitRef)
+			createDashboardServerOptions.templatesGitRef,
+			createDashboardServerOptions.templatesGitCaCertContents)
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed to create git fetcher")
 		}
@@ -311,10 +312,6 @@ func newDashboardServer(createDashboardServerOptions *CreateDashboardServerOptio
 		return nil, errors.Wrap(err, "Failed to set external ip addresses")
 	}
 
-	if createDashboardServerOptions.defaultHTTPIngressHostTemplate != "" {
-		platformInstance.SetDefaultHTTPIngressHostTemplate(createDashboardServerOptions.defaultHTTPIngressHostTemplate)
-	}
-
 	if createDashboardServerOptions.imageNamePrefixTemplate != "" {
 		platformInstance.SetImageNamePrefixTemplate(createDashboardServerOptions.imageNamePrefixTemplate)
 	}
@@ -350,7 +347,6 @@ func newDashboardServer(createDashboardServerOptions *CreateDashboardServerOptio
 		createDashboardServerOptions.offline,
 		functionTemplatesRepository,
 		createDashboardServerOptions.platformConfiguration,
-		createDashboardServerOptions.defaultHTTPIngressHostTemplate,
 		createDashboardServerOptions.imageNamePrefixTemplate,
 		createDashboardServerOptions.platformAuthorizationMode,
 		createDashboardServerOptions.dependantImageRegistryURL)

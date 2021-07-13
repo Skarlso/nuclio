@@ -26,8 +26,11 @@ import (
 
 	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/dashboard"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/platform"
+	"github.com/nuclio/nuclio/pkg/platform/abstract/project/external/leader/iguazio"
 	"github.com/nuclio/nuclio/pkg/platform/kube"
+	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/restful"
 
 	"github.com/nuclio/errors"
@@ -66,11 +69,18 @@ func (pr *projectResource) GetAll(request *http.Request) (map[string]restful.Att
 		return nil, nuclio.NewErrBadRequest("Namespace must exist")
 	}
 
+	requestOrigin, sessionCookie := pr.getRequestOriginAndSessionCookie(request)
 	projects, err := pr.getPlatform().GetProjects(&platform.GetProjectsOptions{
 		Meta: platform.ProjectMeta{
 			Name:      request.Header.Get("x-nuclio-project-name"),
 			Namespace: namespace,
 		},
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
+		SessionCookie: sessionCookie,
+		RequestOrigin: requestOrigin,
 	})
 
 	if err != nil {
@@ -82,7 +92,7 @@ func (pr *projectResource) GetAll(request *http.Request) (map[string]restful.Att
 	// create a map of attributes keyed by the project id (name)
 	for _, project := range projects {
 		if exportProject {
-			response[project.GetConfig().Meta.Name] = pr.export(project)
+			response[project.GetConfig().Meta.Name] = pr.export(request, project)
 		} else {
 			response[project.GetConfig().Meta.Name] = pr.projectToAttributes(project)
 		}
@@ -100,14 +110,14 @@ func (pr *projectResource) GetByID(request *http.Request, id string) (restful.At
 		return nil, nuclio.NewErrBadRequest("Namespace must exist")
 	}
 
-	project, err := pr.getProjectByName(id, namespace)
+	project, err := pr.getProjectByName(request, id, namespace)
 	if err != nil {
 		return nil, err
 	}
 
 	exportProject := pr.GetURLParamBoolOrDefault(request, restful.ParamExport, false)
 	if exportProject {
-		return pr.export(project), nil
+		return pr.export(request, project), nil
 	}
 
 	return pr.projectToAttributes(project), nil
@@ -130,7 +140,7 @@ func (pr *projectResource) Create(request *http.Request) (id string, attributes 
 		}
 		projectImportOptions.authConfig = authConfig
 
-		return pr.importProject(projectImportOptions)
+		return pr.importProject(request, projectImportOptions)
 	}
 
 	projectInfo, responseErr := pr.getProjectInfoFromRequest(request)
@@ -138,7 +148,7 @@ func (pr *projectResource) Create(request *http.Request) (id string, attributes 
 		return
 	}
 
-	return pr.createProject(projectInfo)
+	return pr.createProject(request, projectInfo)
 }
 
 // returns a list of custom routes for the resource
@@ -160,7 +170,7 @@ func (pr *projectResource) GetCustomRoutes() ([]restful.CustomRoute, error) {
 	}, nil
 }
 
-func (pr *projectResource) export(project platform.Project) restful.Attributes {
+func (pr *projectResource) export(request *http.Request, project platform.Project) restful.Attributes {
 	projectMeta := project.GetConfig().Meta
 
 	pr.Logger.InfoWith("Exporting project", "projectName", projectMeta.Name)
@@ -179,7 +189,7 @@ func (pr *projectResource) export(project platform.Project) restful.Attributes {
 	}
 
 	// get functions and function events to export
-	functionsMap, functionEventsMap := pr.getFunctionsAndFunctionEventsMap(project)
+	functionsMap, functionEventsMap := pr.getFunctionsAndFunctionEventsMap(request, project)
 
 	// get api-gateways to export
 	apiGatewaysMap := pr.getAPIGatewaysMap(project)
@@ -203,7 +213,7 @@ func (pr *projectResource) getAPIGatewaysMap(project platform.Project) map[strin
 	return apiGatewaysMap
 }
 
-func (pr *projectResource) getFunctionsAndFunctionEventsMap(project platform.Project) (map[string]restful.Attributes,
+func (pr *projectResource) getFunctionsAndFunctionEventsMap(request *http.Request, project platform.Project) (map[string]restful.Attributes,
 	map[string]restful.Attributes) {
 
 	functionsMap := map[string]restful.Attributes{}
@@ -213,6 +223,10 @@ func (pr *projectResource) getFunctionsAndFunctionEventsMap(project platform.Pro
 		Name:      "",
 		Namespace: project.GetConfig().Meta.Namespace,
 		Labels:    fmt.Sprintf("nuclio.io/project-name=%s", project.GetConfig().Meta.Name),
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	}
 
 	functions, err := pr.getPlatform().GetFunctions(getFunctionsOptions)
@@ -227,7 +241,7 @@ func (pr *projectResource) getFunctionsAndFunctionEventsMap(project platform.Pro
 	for _, function := range functions {
 		functionsMap[function.GetConfig().Meta.Name] = functionResourceInstance.export(function)
 
-		functionEvents := functionEventResourceInstance.getFunctionEvents(function, namespace)
+		functionEvents := functionEventResourceInstance.getFunctionEvents(request, function, namespace)
 		for _, functionEvent := range functionEvents {
 			functionEventsMap[functionEvent.GetConfig().Meta.Name] =
 				functionEventResourceInstance.functionEventToAttributes(functionEvent)
@@ -237,7 +251,7 @@ func (pr *projectResource) getFunctionsAndFunctionEventsMap(project platform.Pro
 	return functionsMap, functionEventsMap
 }
 
-func (pr *projectResource) createProject(projectInfoInstance *projectInfo) (id string,
+func (pr *projectResource) createProject(request *http.Request, projectInfoInstance *projectInfo) (id string,
 	attributes restful.Attributes, responseErr error) {
 
 	// create a project config
@@ -252,10 +266,18 @@ func (pr *projectResource) createProject(projectInfoInstance *projectInfo) (id s
 		return "", nil, nuclio.WrapErrInternalServerError(err)
 	}
 
+	requestOrigin, sessionCookie := pr.getRequestOriginAndSessionCookie(request)
+
 	// just deploy. the status is async through polling
 	pr.Logger.DebugWith("Creating project", "newProject", newProject)
 	if err := pr.getPlatform().CreateProject(&platform.CreateProjectOptions{
 		ProjectConfig: newProject.GetConfig(),
+		RequestOrigin: requestOrigin,
+		SessionCookie: sessionCookie,
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	}); err != nil {
 		if strings.Contains(errors.Cause(err).Error(), "already exists") {
 			return "", nil, nuclio.WrapErrConflict(err)
@@ -271,10 +293,19 @@ func (pr *projectResource) createProject(projectInfoInstance *projectInfo) (id s
 	return
 }
 
-func (pr *projectResource) importProject(projectImportOptions *ProjectImportOptions) (
+func (pr *projectResource) getRequestOriginAndSessionCookie(request *http.Request) (platformconfig.ProjectsLeaderKind, *http.Cookie) {
+	requestOrigin := platformconfig.ProjectsLeaderKind(request.Header.Get(iguazio.ProjectsRoleHeaderKey))
+
+	// ignore error here, and just return a nil cookie when no session was passed (relevant only on leader/follower mode)
+	sessionCookie, _ := request.Cookie("session")
+
+	return requestOrigin, sessionCookie
+}
+
+func (pr *projectResource) importProject(request *http.Request, projectImportOptions *ProjectImportOptions) (
 	id string, attributes restful.Attributes, responseErr error) {
 
-	project, err := pr.importProjectIfMissing(projectImportOptions)
+	project, err := pr.importProjectIfMissing(request, projectImportOptions)
 	if err != nil {
 		return "", nil, err
 	}
@@ -289,8 +320,8 @@ func (pr *projectResource) importProject(projectImportOptions *ProjectImportOpti
 	pr.enrichProjectImportInfoImportResources(projectImportOptions.projectInfo)
 
 	// import
-	failedFunctions := pr.importProjectFunctions(projectImportOptions.projectInfo, projectImportOptions.authConfig)
-	failedFunctionEvents := pr.importProjectFunctionEvents(projectImportOptions.projectInfo, failedFunctions)
+	failedFunctions := pr.importProjectFunctions(request, projectImportOptions.projectInfo, projectImportOptions.authConfig)
+	failedFunctionEvents := pr.importProjectFunctionEvents(request, projectImportOptions.projectInfo, failedFunctions)
 	failedAPIGateways := pr.importProjectAPIGateways(projectImportOptions.projectInfo)
 
 	attributes = restful.Attributes{
@@ -314,7 +345,7 @@ func (pr *projectResource) importProject(projectImportOptions *ProjectImportOpti
 	return
 }
 
-func (pr *projectResource) importProjectIfMissing(projectImportOptions *ProjectImportOptions) (
+func (pr *projectResource) importProjectIfMissing(request *http.Request, projectImportOptions *ProjectImportOptions) (
 	platform.Project, error) {
 
 	projectName := projectImportOptions.projectInfo.Project.Meta.Name
@@ -325,6 +356,11 @@ func (pr *projectResource) importProjectIfMissing(projectImportOptions *ProjectI
 
 	projects, err := pr.getPlatform().GetProjects(&platform.GetProjectsOptions{
 		Meta: *projectImportOptions.projectInfo.Project.Meta,
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			RaiseForbidden:      true,
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to get projects")
@@ -354,6 +390,10 @@ func (pr *projectResource) importProjectIfMissing(projectImportOptions *ProjectI
 
 		if err := newProject.CreateAndWait(&platform.CreateProjectOptions{
 			ProjectConfig: newProject.GetConfig(),
+			PermissionOptions: opa.PermissionOptions{
+				MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+				OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+			},
 		}); err != nil {
 
 			// preserve err - it might contain an informative status code (validation failure, etc)
@@ -365,12 +405,12 @@ func (pr *projectResource) importProjectIfMissing(projectImportOptions *ProjectI
 		projectImportOptions.projectInfo.Project.Spec = &newProject.GetConfig().Spec
 
 		// get imported project
-		return pr.getProjectByName(newProject.GetConfig().Meta.Name, newProject.GetConfig().Meta.Namespace)
+		return pr.getProjectByName(request, newProject.GetConfig().Meta.Name, newProject.GetConfig().Meta.Namespace)
 	}
 	return projects[0], nil
 }
 
-func (pr *projectResource) importProjectFunctions(projectImportInfoInstance *projectImportInfo,
+func (pr *projectResource) importProjectFunctions(request *http.Request, projectImportInfoInstance *projectImportInfo,
 	authConfig *platform.AuthConfig) []restful.Attributes {
 
 	pr.Logger.InfoWith("Importing project functions", "project", projectImportInfoInstance.Project.Meta.Name)
@@ -388,7 +428,7 @@ func (pr *projectResource) importProjectFunctions(projectImportInfoInstance *pro
 			}
 			function.Meta.Labels["nuclio.io/project-name"] = projectImportInfoInstance.Project.Meta.Name
 
-			if err := pr.importFunction(function, authConfig); err != nil {
+			if err := pr.importFunction(request, function, authConfig); err != nil {
 				pr.Logger.WarnWith("Failed importing function upon project import ",
 					"functionName", functionName,
 					"err", err,
@@ -415,13 +455,18 @@ func (pr *projectResource) importProjectFunctions(projectImportInfoInstance *pro
 	return failedFunctions
 }
 
-func (pr *projectResource) importFunction(function *functionInfo, authConfig *platform.AuthConfig) error {
+func (pr *projectResource) importFunction(request *http.Request, function *functionInfo, authConfig *platform.AuthConfig) error {
 	pr.Logger.InfoWith("Importing project function",
 		"function", function.Meta.Name,
 		"project", function.Meta.Labels["nuclio.io/project-name"])
 	functions, err := pr.getPlatform().GetFunctions(&platform.GetFunctionsOptions{
 		Name:      function.Meta.Name,
 		Namespace: function.Meta.Namespace,
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			RaiseForbidden:      true,
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	})
 	if err != nil {
 		return errors.New("Failed to get functions")
@@ -431,7 +476,7 @@ func (pr *projectResource) importFunction(function *functionInfo, authConfig *pl
 	}
 
 	// validation finished successfully - store and deploy the given function
-	return functionResourceInstance.storeAndDeployFunction(function, authConfig, false)
+	return functionResourceInstance.storeAndDeployFunction(request, function, authConfig, false)
 }
 
 func (pr *projectResource) importProjectAPIGateways(projectImportInfoInstance *projectImportInfo) []restful.Attributes {
@@ -467,7 +512,8 @@ func (pr *projectResource) importProjectAPIGateways(projectImportInfoInstance *p
 	return failedAPIGateways
 }
 
-func (pr *projectResource) importProjectFunctionEvents(projectImportInfoInstance *projectImportInfo,
+func (pr *projectResource) importProjectFunctionEvents(request *http.Request,
+	projectImportInfoInstance *projectImportInfo,
 	failedFunctions []restful.Attributes) []restful.Attributes {
 
 	creationErrorContainsFunction := func(functionName string) bool {
@@ -498,7 +544,7 @@ func (pr *projectResource) importProjectFunctionEvents(projectImportInfoInstance
 			// generate new name for events to avoid collisions
 			functionEvent.Meta.Name = uuid.NewV4().String()
 
-			_, err := functionEventResourceInstance.storeAndDeployFunctionEvent(functionEvent)
+			_, err := functionEventResourceInstance.storeAndDeployFunctionEvent(request, functionEvent)
 			if err != nil {
 				failedFunctionEvents = append(failedFunctionEvents, restful.Attributes{
 					"functionEvent": functionEvent.Spec.DisplayName,
@@ -510,12 +556,20 @@ func (pr *projectResource) importProjectFunctionEvents(projectImportInfoInstance
 	return failedFunctionEvents
 }
 
-func (pr *projectResource) getProjectByName(projectName, projectNamespace string) (platform.Project, error) {
+func (pr *projectResource) getProjectByName(request *http.Request, projectName, projectNamespace string) (platform.Project, error) {
+	requestOrigin, sessionCookie := pr.getRequestOriginAndSessionCookie(request)
 	projects, err := pr.getPlatform().GetProjects(&platform.GetProjectsOptions{
 		Meta: platform.ProjectMeta{
 			Name:      projectName,
 			Namespace: projectNamespace,
 		},
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			RaiseForbidden:      true,
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
+		RequestOrigin: requestOrigin,
+		SessionCookie: sessionCookie,
 	})
 
 	if err != nil {
@@ -542,9 +596,17 @@ func (pr *projectResource) deleteProject(request *http.Request) (*restful.Custom
 	}
 
 	projectDeletionStrategy := request.Header.Get("x-nuclio-delete-project-strategy")
+	requestOrigin, sessionCookie := pr.getRequestOriginAndSessionCookie(request)
+
 	if err = pr.getPlatform().DeleteProject(&platform.DeleteProjectOptions{
-		Meta:     *projectInfo.Meta,
-		Strategy: platform.ResolveProjectDeletionStrategyOrDefault(projectDeletionStrategy),
+		Meta:          *projectInfo.Meta,
+		Strategy:      platform.ResolveProjectDeletionStrategyOrDefault(projectDeletionStrategy),
+		RequestOrigin: requestOrigin,
+		SessionCookie: sessionCookie,
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	}); err != nil {
 		return &restful.CustomRouteFuncResponse{
 			Single:     true,
@@ -574,13 +636,19 @@ func (pr *projectResource) updateProject(request *http.Request) (*restful.Custom
 		}, err
 	}
 
-	projectConfig := platform.ProjectConfig{
-		Meta: *projectInfo.Meta,
-		Spec: *projectInfo.Spec,
-	}
+	requestOrigin, sessionCookie := pr.getRequestOriginAndSessionCookie(request)
 
 	if err = pr.getPlatform().UpdateProject(&platform.UpdateProjectOptions{
-		ProjectConfig: projectConfig,
+		ProjectConfig: platform.ProjectConfig{
+			Meta: *projectInfo.Meta,
+			Spec: *projectInfo.Spec,
+		},
+		RequestOrigin: requestOrigin,
+		SessionCookie: sessionCookie,
+		PermissionOptions: opa.PermissionOptions{
+			MemberIds:           opa.GetUserAndGroupIdsFromHeaders(request),
+			OverrideHeaderValue: request.Header.Get(opa.OverrideHeader),
+		},
 	}); err != nil {
 		pr.Logger.WarnWith("Failed to update project", "err", err)
 		statusCode = common.ResolveErrorStatusCodeOrDefault(err, http.StatusInternalServerError)

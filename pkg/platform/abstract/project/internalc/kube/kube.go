@@ -1,10 +1,10 @@
-package project
+package kube
 
 import (
 	"fmt"
 
 	"github.com/nuclio/nuclio/pkg/platform"
-	abstractproject "github.com/nuclio/nuclio/pkg/platform/abstract/project"
+	"github.com/nuclio/nuclio/pkg/platform/abstract/project"
 	nuclioio "github.com/nuclio/nuclio/pkg/platform/kube/apis/nuclio.io/v1beta1"
 	"github.com/nuclio/nuclio/pkg/platform/kube/client"
 
@@ -21,77 +21,19 @@ type Client struct {
 	consumer *client.Consumer
 }
 
-func NewClient(parentLogger logger.Logger, platform platform.Platform, consumer *client.Consumer) (abstractproject.Client, error) {
-	newClient := Client{
-		Logger:   parentLogger.GetChild("projects-client"),
+func NewClient(parentLogger logger.Logger,
+	platformInstance platform.Platform,
+	consumer *client.Consumer) (project.Client, error) {
+	newClient := &Client{
+		Logger:   parentLogger.GetChild("projects-kube"),
 		consumer: consumer,
-		platform: platform,
+		platform: platformInstance,
 	}
 
-	return &newClient, nil
+	return newClient, nil
 }
 
 func (c *Client) Initialize() error {
-	return c.platform.EnsureDefaultProjectExistence()
-}
-
-func (c *Client) Create(createProjectOptions *platform.CreateProjectOptions) (platform.Project, error) {
-	newProject := nuclioio.NuclioProject{}
-	c.platformProjectToProject(createProjectOptions.ProjectConfig, &newProject)
-
-	nuclioProject, err := c.consumer.NuclioClientSet.NuclioV1beta1().
-		NuclioProjects(newProject.Namespace).
-		Create(&newProject)
-	if err != nil {
-		return nil, errors.Wrap(err, "Failed to create nuclio project")
-	}
-
-	return c.nuclioProjectToPlatformProject(nuclioProject)
-}
-
-func (c *Client) Update(updateProjectOptions *platform.UpdateProjectOptions) (platform.Project, error) {
-	projectInstance, err := c.consumer.NuclioClientSet.NuclioV1beta1().
-		NuclioProjects(updateProjectOptions.ProjectConfig.Meta.Namespace).
-		Get(updateProjectOptions.ProjectConfig.Meta.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, errors.Wrap(err, "Failed to get a project")
-	}
-
-	updatedProject := nuclioio.NuclioProject{}
-	c.platformProjectToProject(&updateProjectOptions.ProjectConfig, &updatedProject)
-	projectInstance.Spec = updatedProject.Spec
-	projectInstance.Annotations = updatedProject.Annotations
-	projectInstance.Labels = updatedProject.Labels
-
-	nuclioProject, err := c.consumer.NuclioClientSet.NuclioV1beta1().
-		NuclioProjects(projectInstance.Namespace).
-		Update(projectInstance)
-	if err != nil {
-		return nil, errors.Wrap(err, "Failed to update nuclio project")
-	}
-
-	return c.nuclioProjectToPlatformProject(nuclioProject)
-}
-
-func (c *Client) Delete(deleteProjectOptions *platform.DeleteProjectOptions) error {
-	if err := c.consumer.NuclioClientSet.NuclioV1beta1().
-		NuclioProjects(deleteProjectOptions.Meta.Namespace).
-		Delete(deleteProjectOptions.Meta.Name, &metav1.DeleteOptions{}); err != nil {
-
-		if apierrors.IsNotFound(err) {
-			return nuclio.NewErrNotFound(fmt.Sprintf("Project %s not found", deleteProjectOptions.Meta.Name))
-		}
-		return errors.Wrapf(err,
-			"Failed to delete project %s from namespace %s",
-			deleteProjectOptions.Meta.Name,
-			deleteProjectOptions.Meta.Namespace)
-	}
-
-	if deleteProjectOptions.WaitForResourcesDeletionCompletion {
-		return c.platform.WaitForProjectResourcesDeletion(&deleteProjectOptions.Meta,
-			deleteProjectOptions.WaitForResourcesDeletionCompletionDuration)
-	}
-
 	return nil
 }
 
@@ -124,7 +66,6 @@ func (c *Client) Get(getProjectsOptions *platform.GetProjectsOptions) ([]platfor
 		projectInstanceList, err := c.consumer.NuclioClientSet.NuclioV1beta1().
 			NuclioProjects(getProjectsOptions.Meta.Namespace).
 			List(metav1.ListOptions{LabelSelector: ""})
-
 		if err != nil {
 			return nil, errors.Wrap(err, "Failed to list projects")
 		}
@@ -146,6 +87,76 @@ func (c *Client) Get(getProjectsOptions *platform.GetProjectsOptions) ([]platfor
 	}
 
 	return platformProjects, nil
+}
+
+func (c *Client) Create(createProjectOptions *platform.CreateProjectOptions) (platform.Project, error) {
+	newProject := nuclioio.NuclioProject{}
+	c.platformProjectToProject(createProjectOptions.ProjectConfig, &newProject)
+
+	nuclioProject, err := c.consumer.NuclioClientSet.NuclioV1beta1().
+		NuclioProjects(newProject.Namespace).
+		Create(&newProject)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to create nuclio project")
+	}
+
+	platformProject, err := c.nuclioProjectToPlatformProject(nuclioProject)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to convert nuclio project to platform project")
+	}
+
+	return platformProject, nil
+}
+
+func (c *Client) Update(updateProjectOptions *platform.UpdateProjectOptions) (platform.Project, error) {
+	projectInstance, err := c.consumer.NuclioClientSet.NuclioV1beta1().
+		NuclioProjects(updateProjectOptions.ProjectConfig.Meta.Namespace).
+		Get(updateProjectOptions.ProjectConfig.Meta.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to get a project")
+	}
+
+	updatedProject := nuclioio.NuclioProject{}
+	c.platformProjectToProject(&updateProjectOptions.ProjectConfig, &updatedProject)
+	projectInstance.Spec = updatedProject.Spec
+	projectInstance.Annotations = updatedProject.Annotations
+	projectInstance.Labels = updatedProject.Labels
+
+	nuclioProject, err := c.consumer.NuclioClientSet.NuclioV1beta1().
+		NuclioProjects(projectInstance.Namespace).
+		Update(projectInstance)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to update nuclio project")
+	}
+
+	platformProject, err := c.nuclioProjectToPlatformProject(nuclioProject)
+	if err != nil {
+		return nil, errors.Wrap(err, "Failed to convert nuclio project to platform project")
+	}
+
+	return platformProject, nil
+}
+
+func (c *Client) Delete(deleteProjectOptions *platform.DeleteProjectOptions) error {
+	if err := c.consumer.NuclioClientSet.NuclioV1beta1().
+		NuclioProjects(deleteProjectOptions.Meta.Namespace).
+		Delete(deleteProjectOptions.Meta.Name, &metav1.DeleteOptions{}); err != nil {
+
+		if apierrors.IsNotFound(err) {
+			return nuclio.NewErrNotFound(fmt.Sprintf("Project %s not found", deleteProjectOptions.Meta.Name))
+		}
+		return errors.Wrapf(err,
+			"Failed to delete project %s from namespace %s",
+			deleteProjectOptions.Meta.Name,
+			deleteProjectOptions.Meta.Namespace)
+	}
+
+	if deleteProjectOptions.WaitForResourcesDeletionCompletion {
+		return c.platform.WaitForProjectResourcesDeletion(&deleteProjectOptions.Meta,
+			deleteProjectOptions.WaitForResourcesDeletionCompletionDuration)
+	}
+
+	return nil
 }
 
 func (c *Client) platformProjectToProject(platformProject *platform.ProjectConfig, project *nuclioio.NuclioProject) {

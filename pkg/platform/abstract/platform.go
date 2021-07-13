@@ -19,17 +19,18 @@ package abstract
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nuclio/nuclio/pkg/common"
 	"github.com/nuclio/nuclio/pkg/containerimagebuilderpusher"
+	"github.com/nuclio/nuclio/pkg/errgroup"
 	"github.com/nuclio/nuclio/pkg/functionconfig"
+	"github.com/nuclio/nuclio/pkg/logprocessing"
+	"github.com/nuclio/nuclio/pkg/opa"
 	"github.com/nuclio/nuclio/pkg/platform"
 	"github.com/nuclio/nuclio/pkg/platformconfig"
 	"github.com/nuclio/nuclio/pkg/processor/build"
@@ -40,8 +41,8 @@ import (
 	"github.com/nuclio/errors"
 	"github.com/nuclio/logger"
 	"github.com/nuclio/nuclio-sdk-go"
-	"golang.org/x/sync/errgroup"
 	"k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -50,22 +51,21 @@ import (
 //
 
 const (
-	FunctionContainerHTTPPort      = 8080
-	DefaultReadinessTimeoutSeconds = 60
-	DefaultTargetCPU               = 75
+	FunctionContainerHTTPPort = 8080
+	DefaultTargetCPU          = 75
 )
 
 type Platform struct {
-	Logger                         logger.Logger
-	platform                       platform.Platform
-	invoker                        *invoker
-	Config                         *platformconfig.Config
-	ExternalIPAddresses            []string
-	DeployLogStreams               *sync.Map
-	ContainerBuilder               containerimagebuilderpusher.BuilderPusher
-	DefaultHTTPIngressHostTemplate string
-	ImageNamePrefixTemplate        string
-	DefaultNamespace               string
+	Logger                  logger.Logger
+	platform                platform.Platform
+	invoker                 *invoker
+	Config                  *platformconfig.Config
+	ExternalIPAddresses     []string
+	DeployLogStreams        *sync.Map
+	ContainerBuilder        containerimagebuilderpusher.BuilderPusher
+	ImageNamePrefixTemplate string
+	DefaultNamespace        string
+	OpaClient               opa.Client
 }
 
 func NewPlatform(parentLogger logger.Logger,
@@ -88,6 +88,8 @@ func NewPlatform(parentLogger logger.Logger,
 	}
 
 	newPlatform.DefaultNamespace = defaultNamespace
+
+	newPlatform.OpaClient = opa.CreateOpaClient(newPlatform.Logger, &platformConfiguration.Opa)
 
 	return newPlatform, nil
 }
@@ -197,8 +199,9 @@ func (ap *Platform) HandleDeployFunction(existingFunctionConfig *functionconfig.
 	// indicate that we're done
 	createFunctionOptions.Logger.InfoWith("Function deploy complete",
 		"functionName", deployResult.UpdatedFunctionConfig.Meta.Name,
-		"httpPort", deployResult.Port)
-
+		"httpPort", deployResult.Port,
+		"internalInvocationURLs", deployResult.FunctionStatus.InternalInvocationURLs,
+		"externalInvocationURLs", deployResult.FunctionStatus.ExternalInvocationURLs)
 	return deployResult, nil
 }
 
@@ -417,10 +420,20 @@ func (ap *Platform) ValidateDeleteFunctionOptions(deleteFunctionOptions *platfor
 		return nuclio.WrapErrConflict(err)
 	}
 
+	// Check OPA permissions
+	permissionOptions := deleteFunctionOptions.PermissionOptions
+	permissionOptions.RaiseForbidden = true
+	if _, err := ap.QueryOPAFunctionPermissions(functionToDelete.GetConfig().Meta.Labels["nuclio.io/project-name"],
+		functionToDelete.GetConfig().Meta.Name,
+		opa.ActionDelete,
+		&permissionOptions); err != nil {
+		return errors.Wrap(err, "Failed authorizing OPA permissions for resource")
+	}
+
 	return nil
 }
 
-// ResolveReservedFunctionNames returns a list of reserved resource names
+// ResolveReservedResourceNames returns a list of reserved resource names
 func (ap *Platform) ResolveReservedResourceNames() []string {
 
 	// these names are reserved for Nuclio internal purposes and to avoid collisions with nuclio internal resources
@@ -432,8 +445,96 @@ func (ap *Platform) ResolveReservedResourceNames() []string {
 	}
 }
 
+// FilterFunctionsByPermissions will filter out some functions
+func (ap *Platform) FilterFunctionsByPermissions(permissionOptions *opa.PermissionOptions,
+	functions []platform.Function) ([]platform.Function, error) {
+
+	// no cleansing is mandated
+	if len(permissionOptions.MemberIds) == 0 {
+		return functions, nil
+	}
+
+	appendLock := sync.Mutex{}
+	errGroup, _ := errgroup.WithContext(context.TODO(), ap.Logger)
+	var permittedFunctions []platform.Function
+	for _, function := range functions {
+		function := function
+		errGroup.Go("QueryOPAFunctionPermissions", func() error {
+
+			// Check OPA permissions
+			if allowed, err := ap.QueryOPAFunctionPermissions(function.GetConfig().Meta.Labels["nuclio.io/project-name"],
+				function.GetConfig().Meta.Name,
+				opa.ActionRead,
+				permissionOptions); err != nil {
+				return errors.Wrap(err, "Failed authorizing OPA permissions for resource")
+			} else if allowed {
+				appendLock.Lock()
+				permittedFunctions = append(permittedFunctions, function)
+				appendLock.Unlock()
+			}
+			return nil
+		})
+	}
+	if err := errGroup.Wait(); err != nil {
+		return nil, errors.Wrap(err, "Failed authorizing OPA permissions for function resources")
+	}
+	return permittedFunctions, nil
+}
+
+// FilterFunctionEventsByPermissions will filter out some function events
+func (ap *Platform) FilterFunctionEventsByPermissions(permissionOptions *opa.PermissionOptions,
+	functionEvents []platform.FunctionEvent) ([]platform.FunctionEvent, error) {
+
+	// no cleansing is mandated
+	if len(permissionOptions.MemberIds) == 0 {
+		return functionEvents, nil
+	}
+
+	appendLock := sync.Mutex{}
+	errGroup, _ := errgroup.WithContext(context.TODO(), ap.Logger)
+	var permittedFunctionEvents []platform.FunctionEvent
+	for _, functionEventInstance := range functionEvents {
+
+		// TODO: handle function event without function name / project name
+		functionName, found := functionEventInstance.GetConfig().Meta.Labels[common.NuclioResourceLabelKeyFunctionName]
+		if !found {
+			continue
+		}
+
+		projectName, found := functionEventInstance.GetConfig().Meta.Labels[common.NuclioResourceLabelKeyProjectName]
+		if !found {
+			continue
+		}
+
+		functionEventInstance := functionEventInstance
+		errGroup.Go("QueryOPAFunctionEventPermissions", func() error {
+
+			// Check OPA permissions
+			if allowed, err := ap.QueryOPAFunctionEventPermissions(projectName,
+				functionName,
+				functionEventInstance.GetConfig().Meta.Name,
+				opa.ActionRead,
+				permissionOptions); err != nil {
+				return errors.Wrap(err, "Failed authorizing OPA permissions for resource")
+			} else if allowed {
+				appendLock.Lock()
+				permittedFunctionEvents = append(permittedFunctionEvents, functionEventInstance)
+				appendLock.Unlock()
+			}
+			return nil
+		})
+	}
+
+	if err := errGroup.Wait(); err != nil {
+		return nil, errors.Wrap(err, "Failed authorizing OPA permissions for function event resources")
+	}
+	return permittedFunctionEvents, nil
+}
+
 // CreateFunctionInvocation will invoke a previously deployed function
-func (ap *Platform) CreateFunctionInvocation(createFunctionInvocationOptions *platform.CreateFunctionInvocationOptions) (*platform.CreateFunctionInvocationResult, error) {
+func (ap *Platform) CreateFunctionInvocation(
+	createFunctionInvocationOptions *platform.CreateFunctionInvocationOptions) (
+	*platform.CreateFunctionInvocationResult, error) {
 	if createFunctionInvocationOptions.Headers == nil {
 		createFunctionInvocationOptions.Headers = http.Header{}
 	}
@@ -515,6 +616,47 @@ func (ap *Platform) CreateFunctionEvent(createFunctionEventOptions *platform.Cre
 	return platform.ErrUnsupportedMethod
 }
 
+func (ap *Platform) EnrichFunctionEvent(functionEventConfig *platform.FunctionEventConfig) error {
+
+	// to avoid blow-ups
+	if functionEventConfig.Meta.Labels == nil {
+		functionEventConfig.Meta.Labels = map[string]string{}
+	}
+
+	functionName, functionNameFound := functionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyFunctionName]
+	if !functionNameFound {
+		return errors.Errorf("Function event has a missing label - `%s`",
+			common.NuclioResourceLabelKeyFunctionName)
+	}
+
+	projectName, projectNameFound := functionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyProjectName]
+	if !projectNameFound {
+		ap.Logger.DebugWith("Enriching function event project name",
+			"functionEventName", functionEventConfig.Meta.Name,
+			"functionEventNamespace", functionEventConfig.Meta.Namespace,
+			"functionName", functionName)
+
+		// infer project name from its function
+		functions, err := ap.platform.GetFunctions(&platform.GetFunctionsOptions{
+			Name:      functionName,
+			Namespace: functionEventConfig.Meta.Namespace,
+		})
+		if err != nil {
+			return errors.Wrap(err, "Failed to get function")
+		}
+		if len(functions) == 0 {
+			return errors.Errorf("The Function event parent function does not exist")
+		}
+
+		function := functions[0]
+		projectName = function.GetConfig().Meta.Labels[common.NuclioResourceLabelKeyProjectName]
+	}
+
+	functionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyFunctionName] = functionName
+	functionEventConfig.Meta.Labels[common.NuclioResourceLabelKeyProjectName] = projectName
+	return nil
+}
+
 // UpdateFunctionEvent will update a previously existing function event
 func (ap *Platform) UpdateFunctionEvent(updateFunctionEventOptions *platform.UpdateFunctionEventOptions) error {
 	return platform.ErrUnsupportedMethod
@@ -536,14 +678,6 @@ func (ap *Platform) SetExternalIPAddresses(externalIPAddresses []string) error {
 	ap.ExternalIPAddresses = externalIPAddresses
 
 	return nil
-}
-
-func (ap *Platform) SetDefaultHTTPIngressHostTemplate(defaultHTTPIngressHostTemplate string) {
-	ap.DefaultHTTPIngressHostTemplate = defaultHTTPIngressHostTemplate
-}
-
-func (ap *Platform) GetDefaultHTTPIngressHostTemplate() string {
-	return ap.DefaultHTTPIngressHostTemplate
 }
 
 func (ap *Platform) SetImageNamePrefixTemplate(imageNamePrefixTemplate string) {
@@ -649,7 +783,7 @@ func (ap *Platform) GetProcessorLogsAndBriefError(scanner *bufio.Scanner) (strin
 	briefErrorsArray := &[]string{}
 
 	for scanner.Scan() {
-		currentLogLine, briefLogLine, err := ap.prettifyProcessorLogLine(scanner.Bytes())
+		currentLogLine, briefLogLine, err := logprocessing.PrettifyFunctionLogLine(ap.Logger, scanner.Bytes())
 		if err != nil {
 			rawLogLine := scanner.Text()
 
@@ -717,10 +851,10 @@ func (ap *Platform) GetProjectResources(projectMeta *platform.ProjectMeta) ([]pl
 	var err error
 	var functions []platform.Function
 	var apiGateways []platform.APIGateway
-	errGroup, _ := errgroup.WithContext(context.TODO())
+	errGroup, _ := errgroup.WithContext(context.TODO(), ap.Logger)
 
 	// get api gateways
-	errGroup.Go(func() error {
+	errGroup.Go("GetAPIGateways", func() error {
 		apiGateways, err = ap.platform.GetAPIGateways(&platform.GetAPIGatewaysOptions{
 			Namespace: projectMeta.Namespace,
 			Labels:    fmt.Sprintf("nuclio.io/project-name=%s", projectMeta.Name),
@@ -732,7 +866,7 @@ func (ap *Platform) GetProjectResources(projectMeta *platform.ProjectMeta) ([]pl
 	})
 
 	// get functions
-	errGroup.Go(func() error {
+	errGroup.Go("GetFunctions", func() error {
 		functions, err = ap.platform.GetFunctions(&platform.GetFunctionsOptions{
 			Namespace: projectMeta.Namespace,
 			Labels:    fmt.Sprintf("nuclio.io/project-name=%s", projectMeta.Name),
@@ -780,6 +914,12 @@ func (ap *Platform) EnsureDefaultProjectExistence() error {
 		if err := ap.platform.CreateProject(&platform.CreateProjectOptions{
 			ProjectConfig: newProject.GetConfig(),
 		}); err != nil {
+
+			// if project already exists, return
+			if apierrors.IsAlreadyExists(errors.RootCause(err)) {
+				return nil
+			}
+
 			return errors.Wrap(err, "Failed to create default project")
 		}
 
@@ -789,6 +929,40 @@ func (ap *Platform) EnsureDefaultProjectExistence() error {
 	}
 
 	return nil
+}
+
+func (ap *Platform) QueryOPAFunctionPermissions(projectName,
+	functionName string,
+	action opa.Action,
+	permissionOptions *opa.PermissionOptions) (bool, error) {
+	if projectName == "" {
+		projectName = "*"
+	}
+	if functionName == "" {
+		functionName = "*"
+	}
+	return ap.queryOPAPermissions(opa.GenerateFunctionResourceString(projectName, functionName),
+		action,
+		permissionOptions)
+}
+
+func (ap *Platform) QueryOPAFunctionEventPermissions(projectName,
+	functionName,
+	functionEventName string,
+	action opa.Action,
+	permissionOptions *opa.PermissionOptions) (bool, error) {
+	if projectName == "" {
+		projectName = "*"
+	}
+	if functionName == "" {
+		functionName = "*"
+	}
+	if functionEventName == "" {
+		functionEventName = "*"
+	}
+	return ap.queryOPAPermissions(opa.GenerateFunctionEventResourceString(projectName, functionName, functionEventName),
+		action,
+		permissionOptions)
 }
 
 func (ap *Platform) functionBuildRequired(functionConfig *functionconfig.Config) (bool, error) {
@@ -844,201 +1018,6 @@ func (ap *Platform) aggregateConsecutiveDuplicateMessages(errorMessagesArray []s
 	}
 
 	return aggregatedErrorsArray
-}
-
-// Prettifies log line, and returns - (formattedLogLine, briefLogLine, error)
-// when line shouldn't be added to brief error message - briefLogLine will be an empty string ("")
-func (ap *Platform) prettifyProcessorLogLine(log []byte) (string, string, error) {
-	var workerID, logStructArgs string
-
-	logStruct := struct {
-		Time    *string `json:"time"`
-		Level   *string `json:"level"`
-		Message *string `json:"message"`
-		Name    *string `json:"name,omitempty"`
-		More    *string `json:"more,omitempty"`
-	}{}
-
-	if ap.isSDKLogLine(log) {
-
-		// when it is a wrapper log line
-		wrapperLogStruct := struct {
-			Datetime *string           `json:"datetime"`
-			Level    *string           `json:"level"`
-			Message  *string           `json:"message"`
-			Name     *string           `json:"name,omitempty"`
-			With     map[string]string `json:"with,omitempty"`
-		}{}
-
-		if err := json.Unmarshal(log[1:], &wrapperLogStruct); err != nil {
-			return "", "", err
-		}
-
-		// manipulate the time format so it can be parsed later
-		unparsedTime := *wrapperLogStruct.Datetime + "Z"
-		unparsedTime = strings.Replace(unparsedTime, " ", "T", 1)
-		unparsedTime = strings.Replace(unparsedTime, ",", ".", 1)
-
-		logStruct.Time = &unparsedTime
-		logStruct.Level = wrapperLogStruct.Level
-		logStruct.Message = wrapperLogStruct.Message
-		logStruct.Name = wrapperLogStruct.Name
-
-		if wrapperLogStruct.With != nil {
-			workerID = wrapperLogStruct.With["worker_id"]
-
-			more := common.CreateKeyValuePairs(wrapperLogStruct.With)
-			logStruct.More = &more
-		}
-
-	} else if err := json.Unmarshal(log, &logStruct); err != nil {
-
-		// when it is a log line generated by the processor
-		return "", "", err
-	}
-
-	// check required fields existence
-	if logStruct.Time == nil || logStruct.Level == nil || logStruct.Message == nil {
-		return "", "", errors.New("Missing required fields in pod log line")
-	}
-
-	parsedTime, err := time.Parse(time.RFC3339, *logStruct.Time)
-	if err != nil {
-		return "", "", err
-	}
-
-	logLevel := strings.ToUpper(*logStruct.Level)[0]
-
-	// if worker ID wasn't explicitly given as an arg, try to infer worker ID from logger name
-	if workerID == "" && logStruct.Name != nil {
-		workerID = ap.tryInferWorkerID(*logStruct.Name)
-	}
-
-	if logStruct.More != nil {
-		logStructArgs = *logStruct.More
-	}
-	messageAndArgs := ap.getMessageAndArgs(*logStruct.Message, logStructArgs, log, workerID)
-
-	res := fmt.Sprintf("[%s] (%c) %s",
-		parsedTime.Format("15:04:05.000"),
-		logLevel,
-		messageAndArgs)
-
-	briefLogLine := ""
-	if ap.shouldAddToBriefErrorsMessage(logLevel, *logStruct.Message, workerID) {
-		briefLogLine = messageAndArgs
-	}
-
-	return res, briefLogLine, nil
-}
-
-// get the worker ID from the logger name, for example:
-// "processor.http.w5.python.logger" -> 5
-func (ap *Platform) tryInferWorkerID(loggerName string) string {
-	processorRe := regexp.MustCompile(`^processor\..*\.w[0-9]+\..*`)
-	if processorRe.MatchString(loggerName) {
-		splitName := strings.Split(loggerName, ".")
-		return splitName[2][1:]
-	}
-
-	return ""
-}
-
-func (ap *Platform) getMessageAndArgs(message string, args string, log []byte, workerID string) string {
-	var additionalKwargsAsString string
-
-	additionalKwargs, err := ap.getLogLineAdditionalKwargs(log)
-	if err != nil {
-		ap.Logger.WarnWith("Failed to get log line's additional kwargs",
-			"logLineMessage", message)
-	}
-	additionalKwargsAsString = common.CreateKeyValuePairs(additionalKwargs)
-
-	// format result depending on args/additional kwargs existence
-	var messageArgsList []string
-	if args != "" {
-		messageArgsList = append(messageArgsList, args)
-	}
-	if additionalKwargsAsString != "" {
-		messageArgsList = append(messageArgsList, additionalKwargsAsString)
-	}
-	if len(messageArgsList) > 0 {
-		return fmt.Sprintf("%s [%s]", message, strings.Join(messageArgsList, " || "))
-	}
-
-	return message
-}
-
-func (ap *Platform) getLogLineAdditionalKwargs(log []byte) (map[string]string, error) {
-	logAsMap := map[string]interface{}{}
-
-	if ap.isSDKLogLine(log) {
-		if err := json.Unmarshal(log[1:], &logAsMap); err != nil {
-			return nil, errors.Wrap(err, "Failed to unmarshal log line")
-		}
-	} else if err := json.Unmarshal(log, &logAsMap); err != nil {
-		return nil, errors.Wrap(err, "Failed to unmarshal log line")
-	}
-
-	additionalKwargs := map[string]string{}
-
-	defaultArgs := []string{"time", "datetime", "level", "message", "with", "more", "name"}
-
-	// validate it is a suitable special arg
-	for argKey, argValue := range logAsMap {
-
-		// validate it is indeed an additional arg - it isn't a default arg
-		if common.StringSliceContainsString(defaultArgs, argKey) {
-			continue
-		}
-
-		// ensure argument is a string
-		if _, ok := argValue.(string); !ok {
-			continue
-		}
-
-		additionalKwargs[argKey] = argValue.(string)
-	}
-
-	return additionalKwargs, nil
-}
-
-func (ap *Platform) isSDKLogLine(logLine []byte) bool {
-	return len(logLine) > 0 && logLine[0] == 'l'
-}
-
-func (ap *Platform) shouldAddToBriefErrorsMessage(logLevel uint8, logMessage, workerID string) bool {
-	knownFailureSubstrings := [...]string{"Failed to connect to broker"}
-	ignoreFailureSubstrings := [...]string{
-		string(common.UnexpectedTerminationChildProcess),
-		string(common.FailedReadFromConnection),
-	}
-
-	// when the log message contains a failure that should be ignored
-	for _, ignoreFailureSubstring := range ignoreFailureSubstrings {
-		if strings.Contains(logMessage, ignoreFailureSubstring) {
-			return false
-		}
-	}
-
-	// show errors only of the first worker
-	// done to prevent error duplication from several workers
-	if workerID != "" && workerID != "0" {
-		return false
-	}
-	// when log level is warning or above
-	if logLevel != 'D' && logLevel != 'I' {
-		return true
-	}
-
-	// when the log message contains a known failure substring
-	for _, knownFailureSubstring := range knownFailureSubstrings {
-		if strings.Contains(logMessage, knownFailureSubstring) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // If a user specify the image name to be built - add "projectName-functionName-" prefix to it
@@ -1277,4 +1256,18 @@ func (ap *Platform) validateDockerImageFields(functionConfig *functionconfig.Con
 	}
 
 	return nil
+}
+
+func (ap *Platform) queryOPAPermissions(resource string,
+	action opa.Action,
+	permissionOptions *opa.PermissionOptions) (bool, error) {
+
+	allowed, err := ap.OpaClient.QueryPermissions(resource, action, permissionOptions)
+	if err != nil {
+		return allowed, nuclio.WrapErrInternalServerError(err)
+	}
+	if !allowed && permissionOptions.RaiseForbidden {
+		return false, nuclio.NewErrForbidden(fmt.Sprintf("Not allowed to %s resource %s", action, resource))
+	}
+	return allowed, nil
 }
